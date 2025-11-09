@@ -1,0 +1,19 @@
+name: test
+channels:
+  - conda-forge
+  - pytorch
+
+dependencies:
+  - python
+  - pip
+
+  - pytest
+  - numpy
+
+  - openmm
+  - xtb-python
+  - ase
+  - openmmtools
+  - pytorch
+  - jax
+  - nequip
