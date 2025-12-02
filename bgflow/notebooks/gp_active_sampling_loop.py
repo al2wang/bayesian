@@ -224,12 +224,12 @@ class ActiveLearningExperiment:
     #     plt.close()
 
     def _plot_empirical_distribution(self, iter_idx):
-        """
-        Plots 3 histograms:
-        1. Gray:  Density of States (What the energy landscape looks like globally).
-        2. Green: True Boltzmann Target (What we theoretically WANT to sample).
-        3. Red:   Active Learning Samples (What we ARE sampling).
-        """
+
+        # plot 3 histograms
+        # 1. gray:  density of states (what the energy landscape looks like globally)
+        # 2. green: true boltzmann target (what we theoretically want to sample)
+        # 3. red:   active learning samples (what we are sampling)
+
         # get current samples
         y_sampled = self.y_train.detach().cpu().numpy().ravel()
         
@@ -239,8 +239,8 @@ class ActiveLearningExperiment:
         # to visualize the boltzmann distribution
 
 
-        # T = self.cfg['temperature']
-        T = 0.1
+        T = self.cfg['temperature']
+        # T = 0.2  # TODO: testing
 
         # avoid overflow/underflow in exp
         y_gt_shifted = self.y_gt - np.min(self.y_gt)
@@ -277,7 +277,7 @@ class ActiveLearningExperiment:
         plt.close()
 
 
-
+    '''
     def _plot_iteration(self, iter_idx, debug_info):
         X_grid = debug_info['X_grid']
         mu = debug_info['mu_grid']
@@ -308,7 +308,49 @@ class ActiveLearningExperiment:
         filename = os.path.join(self.cfg['output_dir'], f"iteration_{iter_idx:04d}.png")
         plt.savefig(filename)
         plt.close()
+    '''
 
+    def _plot_iteration(self, iter_idx, debug_info):
+        X_grid = debug_info['X_grid']
+        mu = debug_info['mu_grid']
+        std = debug_info['std_grid']
+        densities = debug_info['densities_grid']
+        truth = oracle_function(X_grid)
+        
+        # calculate true boltzmann density for comparison
+        energy_true = truth.view(-1)
+        logits_true = -energy_true / self.cfg['temperature']
+        probs_true = torch.nn.functional.softmax(logits_true, dim=0)
+        densities_true = probs_true / self.grid_vol
+        
+        plt.figure(figsize=(10, 8))
+        
+        plt.subplot(2, 1, 1)
+        plt.plot(X_grid.numpy(), truth.numpy(), 'k--', label="truth")
+        plt.plot(X_grid.numpy(), mu.numpy(), 'b-', label="gp mean")
+        plt.fill_between(X_grid.view(-1).numpy(), 
+                        (mu - 2*std).view(-1).numpy(), 
+                        (mu + 2*std).view(-1).numpy(), 
+                        color='blue', alpha=0.2, label="uncertainty")
+        plt.scatter(self.X_train.numpy(), self.y_train.numpy(), c='k', marker='x', label="data")
+        plt.title(f"iter {iter_idx} (energy: {self.cfg['energy_mode']})")
+        plt.legend()
+        
+        plt.subplot(2, 1, 2)
+        # plot model density (red)
+        plt.plot(X_grid.numpy(), densities.numpy(), 'r-', linewidth=2, label="model p(x)")
+        plt.fill_between(X_grid.view(-1).numpy(), 0, densities.view(-1).numpy(), color='red', alpha=0.1)
+        # plot true target density (green)
+        plt.plot(X_grid.numpy(), densities_true.numpy(), 'g--', linewidth=2, label="target p(x)")
+        
+        plt.ylabel("density")
+        plt.xlabel("x")
+        plt.legend()
+        
+        filename = os.path.join(self.cfg['output_dir'], f"iteration_{iter_idx:04d}.png")
+        plt.savefig(filename)
+        plt.close()
+        
     def _plot_high_dim_slices(self, x_center, iter_idx, dims_to_plot=[0, 1, 2]):
         # plots 2 rows: 
         # row 0: GP posterior vs truth
