@@ -57,6 +57,9 @@ class ActiveLearningExperiment:
         self.X_train = torch.rand(2, self.dim) * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
         self.y_train = oracle_function(self.X_train) + self.cfg['noise_var'] * torch.randn(2, 1)
         self.history = []
+        
+        # ensure output dir exists immediately for per-iter plotting
+        os.makedirs(self.cfg['output_dir'], exist_ok=True)
 
     def run(self):
         print(f"starting exp; dim={self.dim}, energy mode={self.cfg['energy_mode']}")
@@ -85,8 +88,10 @@ class ActiveLearningExperiment:
             }
             self.history.append(step_data)
             
-            if i % 10 == 0:
+            if i % 50 == 0:
                 print(f"iter {i}: sampled {x_next.numpy().ravel()} -> y={y_next_obs.item():.4f}")
+                if use_grid_sampling: 
+                    self._plot_iteration(i, debug_info)
 
         self._save_results()
 
@@ -155,11 +160,42 @@ class ActiveLearningExperiment:
             x_next = candidates[best_idx].view(1, self.dim)
             
         return x_next, {'min_energy_found': energy[best_idx].item()}
+    
+    def _plot_iteration(self, iter_idx, debug_info):
+        X_grid = debug_info['X_grid']
+        mu = debug_info['mu_grid']
+        std = debug_info['std_grid']
+        densities = debug_info['densities_grid']
+        truth = oracle_function(X_grid)
+        
+        plt.figure(figsize=(10, 8))
+        
+        plt.subplot(2, 1, 1)
+        plt.plot(X_grid.numpy(), truth.numpy(), 'k--', label="truth")
+        plt.plot(X_grid.numpy(), mu.numpy(), 'b-', label="GP mean")
+        plt.fill_between(X_grid.view(-1).numpy(), 
+                        (mu - 2*std).view(-1).numpy(), 
+                        (mu + 2*std).view(-1).numpy(), 
+                        color='blue', alpha=0.2, label="uncertainty")
+        plt.scatter(self.X_train.numpy(), self.y_train.numpy(), c='k', marker='x', label="data")
+        plt.title(f"iter {iter_idx} (energy mode {self.cfg['energy_mode']})")
+        plt.legend()
+        
+        plt.subplot(2, 1, 2)
+        plt.plot(X_grid.numpy(), densities.numpy(), 'r-', linewidth=2, label="p(x)")
+        plt.fill_between(X_grid.view(-1).numpy(), 0, densities.view(-1).numpy(), color='red', alpha=0.1)
+        plt.ylabel("density")
+        plt.xlabel("X")
+        plt.legend()
+        
+        filename = os.path.join(self.cfg['output_dir'], f"iteration_{iter_idx:04d}.png")
+        plt.savefig(filename)
+        plt.close()
 
     def _save_results(self):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         folder = self.cfg['output_dir']
-        os.makedirs(folder, exist_ok=True)
+        # os.makedirs(folder, exist_ok=True) # created in init
         
         config_path = os.path.join(folder, f"config_{timestamp}.json")
         with open(config_path, 'w') as f:
