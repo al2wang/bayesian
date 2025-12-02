@@ -1,0 +1,15 @@
+{
+    "git_hash": "843e9af",
+    "output_dir": "gp_active_sampling_loop_1202",
+    "seed": 42,
+    "dim": 1,
+    "bounds": [
+        -2.5,
+        2.5
+    ],
+    "n_grid": 5000,
+    "n_iterations": 1000,
+    "temperature": 0.2,
+    "noise_var": 0.1,
+    "energy_mode": "posterior_sample"
+}
