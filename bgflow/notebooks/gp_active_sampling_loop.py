@@ -44,7 +44,7 @@ def calculate_energy(mu, std, mode="gp_classic", beta=1.0):
         # use rsample() to keep the gradient flow
         return torch.distributions.Normal(mu, std).rsample()
     else:
-        raise ValueError(f"Unknown energy mode: {mode}")
+        raise ValueError(f"unknown energy mode: {mode}")
 
 class ActiveLearningExperiment:
     def __init__(self, config):
@@ -52,9 +52,16 @@ class ActiveLearningExperiment:
         torch.manual_seed(config['seed'])
         self.dim = config['dim']
         self.bounds = config['bounds']
-        self.X_train = torch.rand(2, self.dim) * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
-        self.y_train = oracle_function(self.X_train) + self.cfg['noise_var'] * torch.randn(2, 1)
+        n_initial = 50
+        self.X_train = torch.rand(n_initial, self.dim) * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
+        self.y_train = oracle_function(self.X_train) + self.cfg['noise_var'] * torch.randn(n_initial, 1)
         self.history = []
+        
+        # pre-compute ground truth energy distribution for comparison plots
+        # sample a large batch to approximate the true distribution of f(x)
+        n_gt_samples = 20000
+        X_gt = torch.rand(n_gt_samples, self.dim) * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
+        self.y_gt = oracle_function(X_gt).detach().numpy().ravel()
         
         os.makedirs(self.cfg['output_dir'], exist_ok=True)
 
@@ -87,14 +94,16 @@ class ActiveLearningExperiment:
             self.history.append(step_data)
             
             if i % 50 == 0:
+                # 1. Plot the spatial view (Grid or Slices)
                 if use_grid_sampling:
                     print(f"iter {i}: sampled {x_next.numpy().ravel()} -> y={y_next_obs.item():.4f}")
                     self._plot_iteration(i, debug_info)
                 else:
-                    # call the high dim plotter
-                    # pass in x_next, the point we just found
                     print(f"iter {i}: sampled {x_next.numpy().ravel()[:3]}... -> y={y_next_obs.item():.4f}")
                     self._plot_high_dim_slices(x_next.detach(), i, dims_to_plot=[0, 1, 2])
+                
+                # 2. Plot the empirical distribution (Histogram comparison)
+                self._plot_empirical_distribution(i)
 
         self._save_results()
 
@@ -138,26 +147,20 @@ class ActiveLearningExperiment:
         K_inv = torch.linalg.inv(K + self.cfg['noise_var'] * torch.eye(N))
         
         # optimization loop
-        n_restarts = 10
+        n_restarts = 20
         candidates = torch.rand(n_restarts, self.dim) * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
         candidates.requires_grad = True
         
-        optimizer = torch.optim.Adam([candidates], lr=0.1)
+        optimizer = torch.optim.Adam([candidates], lr=0.05)
         
-        for _ in range(50):
+        for _ in range(100):
             optimizer.zero_grad()
             
-            # manually compute posterior using precomputed K_inv to save time
-            # mu = K_s.T * K_inv * y
-            # var = K_ss - K_s.T * K_inv * K_s
             K_s = rbf_kernel_torch(self.X_train, candidates)
             K_ss = rbf_kernel_torch(candidates, candidates)
             
             mu = K_s.T @ K_inv @ self.y_train
             
-            # efficient diagonal calc
-            # cov term: K_s.T @ K_inv @ K_s
-            # only need the diagonal of the result for variance
             weighted_Ks = K_inv @ K_s
             cov_term = torch.sum(K_s * weighted_Ks, dim=0).view(-1, 1)
             var = torch.diag(K_ss).view(-1, 1) - cov_term
@@ -185,11 +188,96 @@ class ActiveLearningExperiment:
             energy = calculate_energy(mu, std, mode=self.cfg['energy_mode'])
             
             best_idx = torch.argmin(energy)
-            # CRITICAL FIX: .detach() breaks the graph history
+            # TODO; FIX: .detach() breaks the graph history
             x_next = candidates[best_idx].view(1, self.dim).detach()
             
         return x_next, {'min_energy_found': energy[best_idx].item()}
     
+    # def _plot_empirical_distribution(self, iter_idx):
+    #     """
+    #     plots histograms comparing the distribution of f(x) (oracle values)
+    #     between the ground truth (random uniform sampling) and the 
+    #     active learning samples collected so far
+    #     """
+    #     # get scalar values from training data (y_train contains noisy obs, 
+    #     # but it represents the values we sampled)
+    #     y_sampled = self.y_train.detach().cpu().numpy().ravel()
+        
+    #     plt.figure(figsize=(8, 6))
+        
+    #     # plot ground truth histogram
+    #     plt.hist(self.y_gt, bins=50, density=True, alpha=0.5, color='gray', 
+    #              label='ground truth (uniform sampling)')
+        
+    #     # plot active sampling histogram
+    #     # i.e. empirical distribution of the samples we have so far (i.e., X_train)
+    #     plt.hist(y_sampled, bins=30, density=True, alpha=0.6, color='red', 
+    #              label=f'active learning samples (N={len(y_sampled)})')
+        
+    #     plt.xlabel("Energy / Oracle Value f(x)")
+    #     plt.ylabel("Density")
+    #     plt.title(f"Iter {iter_idx}: Empirical Distribution of Samples vs Ground Truth")
+    #     plt.legend()
+        
+    #     filename = os.path.join(self.cfg['output_dir'], f"dist_iter_{iter_idx:04d}.png")
+    #     plt.savefig(filename)
+    #     plt.close()
+
+    def _plot_empirical_distribution(self, iter_idx):
+        """
+        Plots 3 histograms:
+        1. Gray:  Density of States (What the energy landscape looks like globally).
+        2. Green: True Boltzmann Target (What we theoretically WANT to sample).
+        3. Red:   Active Learning Samples (What we ARE sampling).
+        """
+        # get current samples
+        y_sampled = self.y_train.detach().cpu().numpy().ravel()
+        
+        # compute weights for true boltzmann target
+        # p(x) ~ exp(-E/T)
+        # since we have uniform samples X_gt, we can weight them by exp(-y_gt/T)
+        # to visualize the boltzmann distribution
+
+
+        # T = self.cfg['temperature']
+        T = 0.1
+
+        # avoid overflow/underflow in exp
+        y_gt_shifted = self.y_gt - np.min(self.y_gt)
+        weights_boltzmann = np.exp(-y_gt_shifted / T)
+        # normalize weights
+        weights_boltzmann /= np.sum(weights_boltzmann)
+
+        plt.figure(figsize=(10, 6))
+        
+        # A. gray: density of states (unif sampling, random guessing)
+        plt.hist(self.y_gt, bins=50, density=True, alpha=0.3, color='gray', 
+                 label='Density of States (Uniform Ground Truth)')
+        
+        # B. green: true target dist (boltzmann)
+        # this is the distribution we are trying to match (like in the paper)
+        plt.hist(self.y_gt, bins=50, density=True, weights=weights_boltzmann, 
+                 histtype='step', linewidth=2, color='green', 
+                 label=f'true target dist (boltzmann) (T={T})')
+        
+        # C. red: active samples
+        # if optimization is working, this should move left (towards lower energy)
+        # should match B if sampling works fine
+        plt.hist(y_sampled, bins=30, density=True, alpha=0.5, color='red', 
+                 label=f'model samples density (N={len(y_sampled)})')
+        
+        plt.xlabel("Energy f(x)")
+        plt.ylabel("Probability Density")
+        plt.title(f"Iter {iter_idx}: Sample Quality vs Target")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        filename = os.path.join(self.cfg['output_dir'], f"dist_iter_{iter_idx:04d}.png")
+        plt.savefig(filename)
+        plt.close()
+
+
+
     def _plot_iteration(self, iter_idx, debug_info):
         X_grid = debug_info['X_grid']
         mu = debug_info['mu_grid']
@@ -220,61 +308,6 @@ class ActiveLearningExperiment:
         filename = os.path.join(self.cfg['output_dir'], f"iteration_{iter_idx:04d}.png")
         plt.savefig(filename)
         plt.close()
-
-    # def _plot_high_dim_slices(self, x_center, iter_idx, dims_to_plot=[0, 1, 2]):
-    #     # plots 1D slices of the GP posterior centered at x_center.
-    #     # x_center: the point selected in this iteration (1, D)
-
-    #     n_plots = len(dims_to_plot)
-    #     fig, axes = plt.subplots(1, n_plots, figsize=(5 * n_plots, 4), sharey=True)
-    #     if n_plots == 1: axes = [axes]
-        
-    #     # create a temporary dense grid for 1 dimension
-    #     N_slice = 200
-    #     linspace = torch.linspace(self.bounds[0], self.bounds[1], N_slice)
-        
-    #     # precompute K_inv for efficiency (standard GP inference)
-    #     N = self.X_train.shape[0]
-    #     K = rbf_kernel_torch(self.X_train, self.X_train)
-    #     K_inv = torch.linalg.inv(K + self.cfg['noise_var'] * torch.eye(N))
-
-    #     for i, dim_idx in enumerate(dims_to_plot):
-    #         # create the slice input
-    #         # start with x_center repeated N_slice times
-    #         x_slice = x_center.repeat(N_slice, 1) 
-    #         # overwrite the specific dimension with the grid
-    #         x_slice[:, dim_idx] = linspace
-            
-    #         # GP prediction on the slice
-    #         # duplicate the manual GP logic here
-    #         K_s = rbf_kernel_torch(self.X_train, x_slice)
-    #         K_ss = rbf_kernel_torch(x_slice, x_slice)
-            
-    #         mu = K_s.T @ K_inv @ self.y_train
-    #         weighted_Ks = K_inv @ K_s
-    #         cov_term = torch.sum(K_s * weighted_Ks, dim=0).view(-1, 1)
-    #         var = torch.diag(K_ss).view(-1, 1) - cov_term
-    #         std = torch.sqrt(torch.clamp(var, min=1e-6))
-            
-    #         # calculate energy (use greedy/mean for viz stability, or sample)
-    #         # visualizing the "mean energy" for interpretability
-    #         energy_mean = calculate_energy(mu, std, mode=self.cfg['energy_mode']) 
-            
-    #         ax = axes[i]
-    #         ax.plot(linspace.numpy(), mu.numpy(), 'b-', label="GP mean")
-    #         ax.fill_between(linspace.numpy(), 
-    #                        (mu - 2*std).flatten().numpy(), 
-    #                        (mu + 2*std).flatten().numpy(), 
-    #                        color='blue', alpha=0.2)
-    #         ax.plot(linspace.numpy(), energy_mean.numpy(), 'r--', label=f"energy {self.cfg['energy_mode']}")
-    #         ax.axvline(x_center[0, dim_idx].item(), color='k', linestyle=':', label="Selected x")
-    #         ax.set_title(f"slice of dim {dim_idx}")
-    #         if i == 0: ax.legend()
-            
-    #     plt.suptitle(f"iter {iter_idx}: local slices around selected point")
-    #     filename = os.path.join(self.cfg['output_dir'], f"slice_iter_{iter_idx:04d}.png")
-    #     plt.savefig(filename)
-    #     plt.close()
 
     def _plot_high_dim_slices(self, x_center, iter_idx, dims_to_plot=[0, 1, 2]):
         # plots 2 rows: 
@@ -364,45 +397,52 @@ def plot_experiment(data_path, output_folder):
     X_train_final = data['X_train']
     history = data['history']
     
-    if 'X_grid' not in history[0]:
-        print("no grid data found (high d run), skipping dense plots.")
-        return
-
-    X_grid = history[0]['X_grid']
-    truth = oracle_function(X_grid)
+    # Check if grid data exists (Low Dim)
+    if 'X_grid' in history[0]:
+        X_grid = history[0]['X_grid']
+        truth = oracle_function(X_grid)
+        last_step = history[-1]
+        iter_idx = last_step['iteration']
+        mu = last_step['mu_grid']
+        std = last_step['std_grid']
+        densities = last_step['densities_grid']
+        
+        plt.figure(figsize=(10, 8))
+        plt.subplot(2, 1, 1)
+        plt.plot(X_grid.numpy(), truth.numpy(), 'k--', label="truth")
+        plt.plot(X_grid.numpy(), mu.numpy(), 'b-', label="GP mean")
+        plt.fill_between(X_grid.view(-1).numpy(), 
+                        (mu - 2*std).view(-1).numpy(), 
+                        (mu + 2*std).view(-1).numpy(), 
+                        color='blue', alpha=0.2, label="uncertainty")
+        plt.scatter(X_train_final.numpy(), oracle_function(X_train_final).numpy(), c='k', marker='x', label="all samples")
+        plt.title(f"iter {iter_idx} (Energy: {data['config']['energy_mode']})")
+        plt.legend()
+        plt.subplot(2, 1, 2)
+        plt.plot(X_grid.numpy(), densities.numpy(), 'r-', linewidth=2, label="sampling density p(x)")
+        plt.fill_between(X_grid.view(-1).numpy(), 0, densities.view(-1).numpy(), color='red', alpha=0.1)
+        plt.ylabel("density")
+        plt.xlabel("X")
+        plt.legend()
+        img_name = os.path.join(output_folder, "summary_plot.png")
+        plt.savefig(img_name)
+        plt.close()
     
-    last_step = history[-1]
-    iter_idx = last_step['iteration']
+    # also save the final empirical distribution
+    y_sampled = data['y_train'].numpy().ravel()
+    # re-compute ground truth for the summary plot (simple random)
+    bounds = data['config']['bounds']
+    dim = data['config']['dim']
+    X_gt = torch.rand(20000, dim) * (bounds[1] - bounds[0]) + bounds[0]
+    y_gt = oracle_function(X_gt).numpy().ravel()
     
-    mu = last_step['mu_grid']
-    std = last_step['std_grid']
-    densities = last_step['densities_grid']
-    
-    plt.figure(figsize=(10, 8))
-    
-    plt.subplot(2, 1, 1)
-    plt.plot(X_grid.numpy(), truth.numpy(), 'k--', label="truth")
-    plt.plot(X_grid.numpy(), mu.numpy(), 'b-', label="GP mean")
-    plt.fill_between(X_grid.view(-1).numpy(), 
-                    (mu - 2*std).view(-1).numpy(), 
-                    (mu + 2*std).view(-1).numpy(), 
-                    color='blue', alpha=0.2, label="uncertainty")
-    
-    plt.scatter(X_train_final.numpy(), oracle_function(X_train_final).numpy(), c='k', marker='x', label="all samples")
-    plt.title(f"iter {iter_idx} (Energy: {data['config']['energy_mode']})")
+    plt.figure(figsize=(8, 6))
+    plt.hist(y_gt, bins=50, density=True, alpha=0.5, color='gray', label='Ground Truth')
+    plt.hist(y_sampled, bins=30, density=True, alpha=0.6, color='red', label='Sampled')
+    plt.title("Final Empirical Distribution")
     plt.legend()
-    
-    plt.subplot(2, 1, 2)
-    plt.plot(X_grid.numpy(), densities.numpy(), 'r-', linewidth=2, label="sampling density p(x)")
-    plt.fill_between(X_grid.view(-1).numpy(), 0, densities.view(-1).numpy(), color='red', alpha=0.1)
-    plt.ylabel("density")
-    plt.xlabel("X")
-    plt.legend()
-    
-    img_name = os.path.join(output_folder, "summary_plot.png")
-    plt.savefig(img_name)
+    plt.savefig(os.path.join(output_folder, "final_distribution.png"))
     plt.close()
-    print(f"saved plot to {img_name}")
 
 if __name__ == "__main__":
     
@@ -410,7 +450,7 @@ if __name__ == "__main__":
         'git_hash': get_git_short_hash(),
         'output_dir': "gp_active_sampling_loop_1202",
         'seed': 42,
-        'dim': 10,
+        'dim': 1,
         'bounds': [-2.5, 2.5],
         'n_grid': 5000,
         'n_iterations': 1000, 
