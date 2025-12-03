@@ -59,8 +59,11 @@ class ActiveLearningExperiment:
         
         # pre-compute ground truth energy distribution for comparison plots
         # sample a large batch to approximate the true distribution of f(x)
-        n_gt_samples = 20000
-        X_gt = torch.rand(n_gt_samples, self.dim) * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
+        # TODO: use linspace for 1d to get accurate density of states (gray line), otherwise use rand
+        if self.dim == 1:
+            X_gt = torch.linspace(self.bounds[0], self.bounds[1], 10000).view(-1, 1)
+        else:
+            X_gt = torch.rand(20000, self.dim) * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
         self.y_gt = oracle_function(X_gt).detach().numpy().ravel()
         
         os.makedirs(self.cfg['output_dir'], exist_ok=True)
@@ -94,7 +97,7 @@ class ActiveLearningExperiment:
             self.history.append(step_data)
             
             if i % 50 == 0:
-                # 1. Plot the spatial view (Grid or Slices)
+                # plot the spatial view (grid or slices)
                 if use_grid_sampling:
                     print(f"iter {i}: sampled {x_next.numpy().ravel()} -> y={y_next_obs.item():.4f}")
                     self._plot_iteration(i, debug_info)
@@ -102,7 +105,7 @@ class ActiveLearningExperiment:
                     print(f"iter {i}: sampled {x_next.numpy().ravel()[:3]}... -> y={y_next_obs.item():.4f}")
                     self._plot_high_dim_slices(x_next.detach(), i, dims_to_plot=[0, 1, 2])
                 
-                # 2. Plot the empirical distribution (Histogram comparison)
+                # plot the empirical distribution (histogram comparison)
                 self._plot_empirical_distribution(i)
 
         self._save_results()
@@ -223,52 +226,93 @@ class ActiveLearningExperiment:
     #     plt.savefig(filename)
     #     plt.close()
 
-    def _plot_empirical_distribution(self, iter_idx):
+    # def _plot_empirical_distribution(self, iter_idx):
 
-        # plot 3 histograms
-        # 1. gray:  density of states (what the energy landscape looks like globally)
-        # 2. green: true boltzmann target (what we theoretically want to sample)
-        # 3. red:   active learning samples (what we are sampling)
+    #     # plot 3 histograms
+    #     # 1. gray:  density of states (what the energy landscape looks like globally)
+    #     # 2. green: true boltzmann target (what we theoretically want to sample)
+    #     # 3. red:   active learning samples (what we are sampling)
 
-        # get current samples
-        y_sampled = self.y_train.detach().cpu().numpy().ravel()
+    #     # get current samples
+    #     y_sampled = self.y_train.detach().cpu().numpy().ravel()
         
-        # compute weights for true boltzmann target
-        # p(x) ~ exp(-E/T)
-        # since we have uniform samples X_gt, we can weight them by exp(-y_gt/T)
-        # to visualize the boltzmann distribution
+    #     # compute weights for true boltzmann target
+    #     # p(x) ~ exp(-E/T)
+    #     # since we have uniform samples X_gt, we can weight them by exp(-y_gt/T)
+    #     # to visualize the boltzmann distribution
 
 
+    #     T = self.cfg['temperature']
+    #     # T = 0.2  # TODO: testing
+
+    #     # avoid overflow/underflow in exp
+    #     y_gt_shifted = self.y_gt - np.min(self.y_gt)
+    #     weights_boltzmann = np.exp(-y_gt_shifted / T)
+    #     # normalize weights
+    #     weights_boltzmann /= np.sum(weights_boltzmann)
+
+    #     plt.figure(figsize=(10, 6))
+        
+    #     # A. gray: density of states (unif sampling, random guessing)
+    #     plt.hist(self.y_gt, bins=50, density=True, alpha=0.3, color='gray', 
+    #              label='Density of States (Uniform Ground Truth)')
+        
+    #     # B. green: true target dist (boltzmann)
+    #     # this is the distribution we are trying to match (like in the paper)
+    #     plt.hist(self.y_gt, bins=50, density=True, weights=weights_boltzmann, 
+    #              histtype='step', linewidth=2, color='green', 
+    #              label=f'true target dist (boltzmann) (T={T})')
+        
+    #     # C. red: active samples
+    #     # if optimization is working, this should move left (towards lower energy)
+    #     # should match B if sampling works fine
+    #     plt.hist(y_sampled, bins=30, density=True, alpha=0.5, color='red', 
+    #              label=f'model samples density (N={len(y_sampled)})')
+        
+    #     plt.xlabel("Energy f(x)")
+    #     plt.ylabel("Probability Density")
+    #     plt.title(f"Iter {iter_idx}: Sample Quality vs Target")
+    #     plt.legend()
+    #     plt.grid(True, alpha=0.3)
+        
+    #     filename = os.path.join(self.cfg['output_dir'], f"dist_iter_{iter_idx:04d}.png")
+    #     plt.savefig(filename)
+    #     plt.close()
+
+    def _plot_empirical_distribution(self, iter_idx):
+        if self.dim != 1:
+            return
+
+        # get history of samples
+        # self.X_train contains all samples collected so far
+        x_sampled = self.X_train.detach().cpu().numpy().ravel()
+        
+        # target energy density
+        # green curve
+        grid_res = 1000
+        x_grid = torch.linspace(self.bounds[0], self.bounds[1], grid_res).view(-1, 1)
+        y_grid_true = oracle_function(x_grid) 
+        
         T = self.cfg['temperature']
-        # T = 0.2  # TODO: testing
-
-        # avoid overflow/underflow in exp
-        y_gt_shifted = self.y_gt - np.min(self.y_gt)
-        weights_boltzmann = np.exp(-y_gt_shifted / T)
-        # normalize weights
-        weights_boltzmann /= np.sum(weights_boltzmann)
+        logits = -y_grid_true / T  # boltzmann P(x) ~ exp(-E(x)/T)
+        probs = torch.nn.functional.softmax(logits, dim=0)
+        
+        dx = (self.bounds[1] - self.bounds[0]) / grid_res  # convert to density (prob/dx)
+        density_target = probs / dx                        # to match histogram scale
 
         plt.figure(figsize=(10, 6))
         
-        # A. gray: density of states (unif sampling, random guessing)
-        plt.hist(self.y_gt, bins=50, density=True, alpha=0.3, color='gray', 
-                 label='Density of States (Uniform Ground Truth)')
+        # histogram of sampled locations (history)
+        plt.hist(x_sampled, bins=40, density=True, alpha=0.5, color='red', 
+                 label=f'sampled X (history, N={len(x_sampled)})')
         
-        # B. green: true target dist (boltzmann)
-        # this is the distribution we are trying to match (like in the paper)
-        plt.hist(self.y_gt, bins=50, density=True, weights=weights_boltzmann, 
-                 histtype='step', linewidth=2, color='green', 
-                 label=f'true target dist (boltzmann) (T={T})')
+        # target density
+        plt.plot(x_grid.numpy(), density_target.numpy(), 'g-', linewidth=2, 
+                 label=f'target density')
         
-        # C. red: active samples
-        # if optimization is working, this should move left (towards lower energy)
-        # should match B if sampling works fine
-        plt.hist(y_sampled, bins=30, density=True, alpha=0.5, color='red', 
-                 label=f'model samples density (N={len(y_sampled)})')
-        
-        plt.xlabel("Energy f(x)")
-        plt.ylabel("Probability Density")
-        plt.title(f"Iter {iter_idx}: Sample Quality vs Target")
+        plt.xlabel("input space x")
+        plt.ylabel("prob density")
+        plt.title(f"iter {iter_idx}")
         plt.legend()
         plt.grid(True, alpha=0.3)
         
