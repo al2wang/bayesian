@@ -7,6 +7,13 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+# new imports for botorch logic
+from botorch.models import SingleTaskGP # import botorch gp model
+from botorch.fit import fit_gpytorch_mll # helper to fit model
+from gpytorch.mlls import ExactMarginalLogLikelihood # loss function for gp
+from botorch.acquisition import ExpectedImprovement, UpperConfidenceBound, LogExpectedImprovement # acquisition functions
+from botorch.optim import optimize_acqf # optimization helper
+
 # util for config/versioning
 def get_git_short_hash():
     try:
@@ -44,7 +51,8 @@ def calculate_energy(mu, std, mode="gp_classic", beta=1.0):
         # use rsample() to keep the gradient flow
         return torch.distributions.Normal(mu, std).rsample()
     else:
-        raise ValueError(f"unknown energy mode: {mode}")
+        # fallback for botorch modes (EI, UCB) during visualization, just return mean
+        return mu 
 
 class ActiveLearningExperiment:
     def __init__(self, config):
@@ -59,7 +67,7 @@ class ActiveLearningExperiment:
         
         # pre-compute ground truth energy distribution for comparison plots
         # sample a large batch to approximate the true distribution of f(x)
-        # TODO: use linspace for 1d to get accurate density of states (gray line), otherwise use rand
+        # use linspace for 1d to get accurate density of states (gray line), otherwise use rand
         if self.dim == 1:
             X_gt = torch.linspace(self.bounds[0], self.bounds[1], 10000).view(-1, 1)
         else:
@@ -70,14 +78,21 @@ class ActiveLearningExperiment:
 
     def run(self):
         print(f"starting exp; dim={self.dim}, energy mode={self.cfg['energy_mode']}")
-        use_grid_sampling = self.dim <= 2
+        
+        # determine if we are using botorch mode
+        use_botorch = self.cfg['energy_mode'] in ['EI', 'UCB', 'LogEI'] # check for botorch keywords
+        use_grid_sampling = (self.dim <= 2) and (not use_botorch) # prioritize botorch logic over grid if selected
+        
         if use_grid_sampling:
             self._setup_grid()
         
         for i in range(self.cfg['n_iterations']):
             x_next = None
             debug_info = {}
-            if use_grid_sampling:
+            
+            if use_botorch: # branch for botorch acquisition
+                x_next, debug_info = self._step_acquisition(i) # use new botorch step
+            elif use_grid_sampling:
                 x_next, debug_info = self._step_grid(i)
             else:
                 x_next, debug_info = self._step_optimizer(i)
@@ -96,14 +111,15 @@ class ActiveLearningExperiment:
             }
             self.history.append(step_data)
             
-            if i % 50 == 0:
+            if i % 10 == 0: # reduced print frequency for high-d loop
                 # plot the spatial view (grid or slices)
                 if use_grid_sampling:
                     print(f"iter {i}: sampled {x_next.numpy().ravel()} -> y={y_next_obs.item():.4f}")
                     self._plot_iteration(i, debug_info)
                 else:
                     print(f"iter {i}: sampled {x_next.numpy().ravel()[:3]}... -> y={y_next_obs.item():.4f}")
-                    self._plot_high_dim_slices(x_next.detach(), i, dims_to_plot=[0, 1, 2])
+                    # for botorch/high-d, calculate energy manually for slice visualization
+                    self._plot_high_dim_slices(x_next.detach(), i, dims_to_plot=[0, 1] if self.dim > 1 else [0])
                 
                 # plot the empirical distribution (histogram comparison)
                 self._plot_empirical_distribution(i)
@@ -141,6 +157,39 @@ class ActiveLearningExperiment:
             'densities_grid': prob_densities.cpu(),
             'X_grid': self.X_grid.cpu()
         }
+
+    # new function for botorch acquisition
+    def _step_acquisition(self, iter_idx): 
+        # botorch maximizes, so we negate y (since we want to minimize energy)
+        train_X = self.X_train # use current training x
+        train_Y = -self.y_train # negate y for minimization task
+        
+        # fit standard gp using botorch helper
+        gp = SingleTaskGP(train_X, train_Y) # create botorch gp
+        mll = ExactMarginalLogLikelihood(gp.likelihood, gp) # marginal log likelihood
+        fit_gpytorch_mll(mll) # fit hyperparameters
+        
+        # define acquisition function based on config
+        acq_func = None
+        if self.cfg['energy_mode'] == 'EI':
+            acq_func = ExpectedImprovement(model=gp, best_f=train_Y.max()) # classic ei
+        elif self.cfg['energy_mode'] == 'LogEI':
+             acq_func = LogExpectedImprovement(model=gp, best_f=train_Y.max()) # log ei for numerical stability
+        elif self.cfg['energy_mode'] == 'UCB':
+            acq_func = UpperConfidenceBound(model=gp, beta=0.1) # ucb with fixed beta
+            
+        # optimize acquisition function
+        bounds = torch.tensor([self.bounds] * self.dim).t() # shape bounds for botorch
+        candidates, _ = optimize_acqf( # optimize using standard bfgs/adam internal
+            acq_function=acq_func,
+            bounds=bounds,
+            q=1, # batch size 1
+            num_restarts=10, # restarts for non-convex acq optimization
+            raw_samples=200, # initialization samples
+        )
+        
+        x_next = candidates.detach() # detach from graph
+        return x_next, {'acq_val': _} # return candidate
 
     def _step_optimizer(self, iter_idx):
         # precompute K_inv ONCE per iteration
@@ -196,89 +245,6 @@ class ActiveLearningExperiment:
             
         return x_next, {'min_energy_found': energy[best_idx].item()}
     
-    # def _plot_empirical_distribution(self, iter_idx):
-    #     """
-    #     plots histograms comparing the distribution of f(x) (oracle values)
-    #     between the ground truth (random uniform sampling) and the 
-    #     active learning samples collected so far
-    #     """
-    #     # get scalar values from training data (y_train contains noisy obs, 
-    #     # but it represents the values we sampled)
-    #     y_sampled = self.y_train.detach().cpu().numpy().ravel()
-        
-    #     plt.figure(figsize=(8, 6))
-        
-    #     # plot ground truth histogram
-    #     plt.hist(self.y_gt, bins=50, density=True, alpha=0.5, color='gray', 
-    #              label='ground truth (uniform sampling)')
-        
-    #     # plot active sampling histogram
-    #     # i.e. empirical distribution of the samples we have so far (i.e., X_train)
-    #     plt.hist(y_sampled, bins=30, density=True, alpha=0.6, color='red', 
-    #              label=f'active learning samples (N={len(y_sampled)})')
-        
-    #     plt.xlabel("Energy / Oracle Value f(x)")
-    #     plt.ylabel("Density")
-    #     plt.title(f"Iter {iter_idx}: Empirical Distribution of Samples vs Ground Truth")
-    #     plt.legend()
-        
-    #     filename = os.path.join(self.cfg['output_dir'], f"dist_iter_{iter_idx:04d}.png")
-    #     plt.savefig(filename)
-    #     plt.close()
-
-    # def _plot_empirical_distribution(self, iter_idx):
-
-    #     # plot 3 histograms
-    #     # 1. gray:  density of states (what the energy landscape looks like globally)
-    #     # 2. green: true boltzmann target (what we theoretically want to sample)
-    #     # 3. red:   active learning samples (what we are sampling)
-
-    #     # get current samples
-    #     y_sampled = self.y_train.detach().cpu().numpy().ravel()
-        
-    #     # compute weights for true boltzmann target
-    #     # p(x) ~ exp(-E/T)
-    #     # since we have uniform samples X_gt, we can weight them by exp(-y_gt/T)
-    #     # to visualize the boltzmann distribution
-
-
-    #     T = self.cfg['temperature']
-    #     # T = 0.2  # TODO: testing
-
-    #     # avoid overflow/underflow in exp
-    #     y_gt_shifted = self.y_gt - np.min(self.y_gt)
-    #     weights_boltzmann = np.exp(-y_gt_shifted / T)
-    #     # normalize weights
-    #     weights_boltzmann /= np.sum(weights_boltzmann)
-
-    #     plt.figure(figsize=(10, 6))
-        
-    #     # A. gray: density of states (unif sampling, random guessing)
-    #     plt.hist(self.y_gt, bins=50, density=True, alpha=0.3, color='gray', 
-    #              label='Density of States (Uniform Ground Truth)')
-        
-    #     # B. green: true target dist (boltzmann)
-    #     # this is the distribution we are trying to match (like in the paper)
-    #     plt.hist(self.y_gt, bins=50, density=True, weights=weights_boltzmann, 
-    #              histtype='step', linewidth=2, color='green', 
-    #              label=f'true target dist (boltzmann) (T={T})')
-        
-    #     # C. red: active samples
-    #     # if optimization is working, this should move left (towards lower energy)
-    #     # should match B if sampling works fine
-    #     plt.hist(y_sampled, bins=30, density=True, alpha=0.5, color='red', 
-    #              label=f'model samples density (N={len(y_sampled)})')
-        
-    #     plt.xlabel("Energy f(x)")
-    #     plt.ylabel("Probability Density")
-    #     plt.title(f"Iter {iter_idx}: Sample Quality vs Target")
-    #     plt.legend()
-    #     plt.grid(True, alpha=0.3)
-        
-    #     filename = os.path.join(self.cfg['output_dir'], f"dist_iter_{iter_idx:04d}.png")
-    #     plt.savefig(filename)
-    #     plt.close()
-
     def _plot_empirical_distribution(self, iter_idx):
         if self.dim != 1:
             return
@@ -319,40 +285,6 @@ class ActiveLearningExperiment:
         filename = os.path.join(self.cfg['output_dir'], f"dist_iter_{iter_idx:04d}.png")
         plt.savefig(filename)
         plt.close()
-
-
-    '''
-    def _plot_iteration(self, iter_idx, debug_info):
-        X_grid = debug_info['X_grid']
-        mu = debug_info['mu_grid']
-        std = debug_info['std_grid']
-        densities = debug_info['densities_grid']
-        truth = oracle_function(X_grid)
-        
-        plt.figure(figsize=(10, 8))
-        
-        plt.subplot(2, 1, 1)
-        plt.plot(X_grid.numpy(), truth.numpy(), 'k--', label="truth")
-        plt.plot(X_grid.numpy(), mu.numpy(), 'b-', label="GP mean")
-        plt.fill_between(X_grid.view(-1).numpy(), 
-                        (mu - 2*std).view(-1).numpy(), 
-                        (mu + 2*std).view(-1).numpy(), 
-                        color='blue', alpha=0.2, label="uncertainty")
-        plt.scatter(self.X_train.numpy(), self.y_train.numpy(), c='k', marker='x', label="data")
-        plt.title(f"iter {iter_idx} (Energy: {self.cfg['energy_mode']})")
-        plt.legend()
-        
-        plt.subplot(2, 1, 2)
-        plt.plot(X_grid.numpy(), densities.numpy(), 'r-', linewidth=2, label="p(x)")
-        plt.fill_between(X_grid.view(-1).numpy(), 0, densities.view(-1).numpy(), color='red', alpha=0.1)
-        plt.ylabel("density")
-        plt.xlabel("X")
-        plt.legend()
-        
-        filename = os.path.join(self.cfg['output_dir'], f"iteration_{iter_idx:04d}.png")
-        plt.savefig(filename)
-        plt.close()
-    '''
 
     def _plot_iteration(self, iter_idx, debug_info):
         X_grid = debug_info['X_grid']
@@ -483,7 +415,7 @@ def plot_experiment(data_path, output_folder):
     X_train_final = data['X_train']
     history = data['history']
     
-    # Check if grid data exists (Low Dim)
+    # check if grid data exists (low dim)
     if 'X_grid' in history[0]:
         X_grid = history[0]['X_grid']
         truth = oracle_function(X_grid)
@@ -522,27 +454,27 @@ def plot_experiment(data_path, output_folder):
     X_gt = torch.rand(20000, dim) * (bounds[1] - bounds[0]) + bounds[0]
     y_gt = oracle_function(X_gt).numpy().ravel()
     
-    plt.figure(figsize=(8, 6))
-    plt.hist(y_gt, bins=50, density=True, alpha=0.5, color='gray', label='Ground Truth')
-    plt.hist(y_sampled, bins=30, density=True, alpha=0.6, color='red', label='Sampled')
-    plt.title("Final Empirical Distribution")
-    plt.legend()
-    plt.savefig(os.path.join(output_folder, "final_distribution.png"))
-    plt.close()
+    # plt.figure(figsize=(8, 6))
+    # plt.hist(X_gt, bins=50, density=True, alpha=0.5, color='gray', label='Ground Truth')
+    # plt.hist(y_sampled, bins=30, density=True, alpha=0.6, color='red', label='sampled')
+    # plt.title("Final Empirical Distribution")
+    # plt.legend()
+    # plt.savefig(os.path.join(output_folder, "final_distribution.png"))
+    # plt.close()
 
 if __name__ == "__main__":
     
     config = {
         'git_hash': get_git_short_hash(),
-        'output_dir': "gp_active_sampling_loop_1202",
+        'output_dir': "gp_active_sampling_loop_botorch",
         'seed': 42,
-        'dim': 1,
+        'dim': 1, # TODO use dim 5 for high d testing
         'bounds': [-2.5, 2.5],
         'n_grid': 5000,
         'n_iterations': 1000, 
         'temperature': 0.2,
         'noise_var': 0.1,
-        'energy_mode': 'posterior_sample' 
+        'energy_mode': 'LogEI' # TODO: from botorch mode
     }
     
     exp = ActiveLearningExperiment(config)
