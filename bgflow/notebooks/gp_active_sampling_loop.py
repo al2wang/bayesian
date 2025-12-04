@@ -6,6 +6,7 @@ import json
 import subprocess
 from datetime import datetime
 from pathlib import Path
+import math
 
 # new imports for botorch logic
 from botorch.models import SingleTaskGP # import botorch gp model
@@ -13,6 +14,8 @@ from botorch.fit import fit_gpytorch_mll # helper to fit model
 from gpytorch.mlls import ExactMarginalLogLikelihood # loss function for gp
 from botorch.acquisition import ExpectedImprovement, UpperConfidenceBound, LogExpectedImprovement # acquisition functions
 from botorch.optim import optimize_acqf # optimization helper
+
+from scipy import stats
 
 # util for config/versioning
 def get_git_short_hash():
@@ -42,18 +45,6 @@ def get_gp_posterior(X_train, y_train, X_test, lengthscale=1.0, noise_var=0.01):
     var = torch.diag(cov).view(-1, 1)
     return mu, var
 
-def calculate_energy(mu, std, mode="gp_classic", beta=1.0):
-    if mode == "gp_classic":
-        return mu - beta * std
-    elif mode == "greedy":
-        return mu
-    elif mode == "posterior_sample":
-        # use rsample() to keep the gradient flow
-        return torch.distributions.Normal(mu, std).rsample()
-    else:
-        # fallback for botorch modes (EI, UCB) during visualization, just return mean
-        return mu 
-
 class ActiveLearningExperiment:
     def __init__(self, config):
         self.cfg = config
@@ -64,6 +55,11 @@ class ActiveLearningExperiment:
         self.X_train = torch.rand(n_initial, self.dim) * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
         self.y_train = oracle_function(self.X_train) + self.cfg['noise_var'] * torch.randn(n_initial, 1)
         self.history = []
+
+        self.X_grid = None
+        self.rkls_kde = []
+        self.rkls_grid = []
+        self.use_grid_sampling = True
         
         # pre-compute ground truth energy distribution for comparison plots
         # sample a large batch to approximate the true distribution of f(x)
@@ -76,26 +72,59 @@ class ActiveLearningExperiment:
         
         os.makedirs(self.cfg['output_dir'], exist_ok=True)
 
+    def calculate_energy(self, mu, std, beta=1.0):
+        mode = self.cfg["energy_mode"]
+        if mode == "gp_classic":
+            return mu - beta * std
+        elif mode == "greedy":
+            return mu
+        elif mode == "posterior_sample":
+            # use rsample() to keep the gradient flow
+            return torch.distributions.Normal(mu, std).rsample()
+        else:
+            # fallback for botorch modes (EI, UCB) during visualization, just return mean
+            return mu
+
     def run(self):
         print(f"starting exp; dim={self.dim}, energy mode={self.cfg['energy_mode']}")
-        
+
+        c = 1
+        while (Path(self.cfg["output_dir"])/str(c)).exists():
+            c += 1
+        self.cfg["output_dir"] = str(Path(self.cfg["output_dir"])/str(c))
+        Path(self.cfg["output_dir"]).mkdir(parents=True, exist_ok=True)
+
+
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder = self.cfg['output_dir']
+        config_path = os.path.join(folder, f"config_{timestamp}.json")
+        with open(config_path, 'w') as f:
+            json.dump(self.cfg, f, indent=4, default=str)
+
+
+
         # determine if we are using botorch mode
-        use_botorch = self.cfg['energy_mode'] in ['EI', 'UCB', 'LogEI'] # check for botorch keywords
-        use_grid_sampling = (self.dim <= 2) and (not use_botorch) # prioritize botorch logic over grid if selected
+        # use_botorch = self.cfg['energy_mode'] in ['EI', 'UCB', 'LogEI'] # check for botorch keywords
+        # use_grid_sampling = (self.dim <= 2) and (not use_botorch) # prioritize botorch logic over grid if selected
         
-        if use_grid_sampling:
+        self.use_grid_sampling = self.cfg["n_candidates"] == 0
+        if self.use_grid_sampling:
             self._setup_grid()
-        
+            self.target_energies = oracle_function(self.X_grid)
+            self.target_densities = self._get_probs(self.target_energies, self.grid_vol)
+        self.Z = self._get_Z()
+
         for i in range(self.cfg['n_iterations']):
             x_next = None
             debug_info = {}
             
-            if use_botorch: # branch for botorch acquisition
-                x_next, debug_info = self._step_acquisition(i) # use new botorch step
-            elif use_grid_sampling:
+            # if use_botorch: # branch for botorch acquisition
+            #     x_next, debug_info = self._step_acquisition(i) # use new botorch step
+            if self.use_grid_sampling:
                 x_next, debug_info = self._step_grid(i)
             else:
-                x_next, debug_info = self._step_optimizer(i)
+                x_next, debug_info = self._step_acquisition(i)
             
             y_next_true = oracle_function(x_next)
             y_next_obs = y_next_true + self.cfg['noise_var'] * torch.randn(1, 1)
@@ -113,13 +142,16 @@ class ActiveLearningExperiment:
             
             if i % 10 == 0: # reduced print frequency for high-d loop
                 # plot the spatial view (grid or slices)
-                if use_grid_sampling:
+                if self.use_grid_sampling:
                     print(f"iter {i}: sampled {x_next.numpy().ravel()} -> y={y_next_obs.item():.4f}")
                     self._plot_iteration(i, debug_info)
                 else:
                     print(f"iter {i}: sampled {x_next.numpy().ravel()[:3]}... -> y={y_next_obs.item():.4f}")
                     # for botorch/high-d, calculate energy manually for slice visualization
                     self._plot_high_dim_slices(x_next.detach(), i, dims_to_plot=[0, 1] if self.dim > 1 else [0])
+                
+                print(f'number of new points {sum(1 for item in self.history if item["new"])} / {i + 1}')
+                self._plot_rkl_loss(i)
                 
                 # plot the empirical distribution (histogram comparison)
                 self._plot_empirical_distribution(i)
@@ -141,21 +173,76 @@ class ActiveLearningExperiment:
             self.grid_vol = side_len ** 2
 
     def _step_grid(self, iter_idx):
-        mu, var = get_gp_posterior(self.X_train, self.y_train, self.X_grid)
-        std = torch.sqrt(torch.clamp(var, min=1e-6))
-        energy = calculate_energy(mu, std, mode=self.cfg['energy_mode'])
+        # mu, var = get_gp_posterior(self.X_train, self.y_train, self.X_grid)
+        # std = torch.sqrt(torch.clamp(var, min=1e-6))
+        # energy = calculate_energy(mu, std, mode=self.cfg['energy_mode'])
+        # logits = -energy / self.cfg['temperature']
+        # probs = torch.nn.functional.softmax(logits, dim=0)
+        # prob_densities = probs / self.grid_vol
+        # categorical = torch.distributions.Categorical(probs.squeeze())
+        # next_idx = categorical.sample()
+        # x_next = self.X_grid[next_idx].view(1, self.dim)
+        
+        # return x_next, {
+        #     'mu_grid': mu.cpu(),
+        #     'std_grid': std.cpu(),
+        #     'densities_grid': prob_densities.cpu(),
+        #     'X_grid': self.X_grid.cpu()
+        # }
+        return self._step_with_candidates(iter_idx, self.X_grid.reshape(-1, self.cfg["dim"]), True)
+
+    def _get_probs(self, energy, grid_vol=None):
+        shape = energy.shape
+        energy = energy.squeeze()
         logits = -energy / self.cfg['temperature']
         probs = torch.nn.functional.softmax(logits, dim=0)
-        prob_densities = probs / self.grid_vol
-        categorical = torch.distributions.Categorical(probs.squeeze())
+        if grid_vol:
+            probs = probs / grid_vol
+        return probs.reshape(shape)
+    
+    def _get_log_probs(self, y, grid_vol):
+        output = -y / self.cfg["temperature"] - torch.log(self.Z)
+        if grid_vol:
+            output -= math.log(grid_vol)
+        return output 
+    
+    def _get_Z(self):
+        
+        if self.X_grid == None:
+            # TODO: use monte carlo sampling instead of calling setup grid
+            self._setup_grid()
+        energy = oracle_function(self.X_grid.reshape(-1, self.cfg["dim"]))  # NOTE: this function only works with vectors
+        logits = -energy / self.cfg['temperature']
+        Z = torch.mean(torch.exp(logits))
+        print(f"this is Z={Z}")
+        return Z
+
+
+    def _step_with_candidates(self, iter_idx, candidates, sample_new_only=False):
+        # print(f'shape = {candidates.shape}')
+
+        assert (len(candidates.shape) == 2)
+        assert (candidates.shape[1] == self.dim)
+
+        mu, var = get_gp_posterior(self.X_train, self.y_train, candidates)  # TODO: rewrite get_gp_posterior with botorch
+        all_candidates = candidates
+        if not sample_new_only:
+            mu = torch.concat([mu, self.y_train])
+            var = torch.concat([var, torch.zeros(self.y_train.shape)])
+            all_candidates = torch.concat([candidates, self.X_train])
+        std = torch.sqrt(torch.clamp(var, min=1e-6))
+        energy = self.calculate_energy(mu, std)
+        prob_densities = self._get_probs(energy, self.grid_vol)
+        categorical = torch.distributions.Categorical(prob_densities.squeeze())
         next_idx = categorical.sample()
-        x_next = self.X_grid[next_idx].view(1, self.dim)
+        x_next = all_candidates[next_idx].view(1, self.dim)
         
         return x_next, {
-            'mu_grid': mu.cpu(),
-            'std_grid': std.cpu(),
-            'densities_grid': prob_densities.cpu(),
-            'X_grid': self.X_grid.cpu()
+            'mu': mu.cpu(),
+            'std': std.cpu(),
+            'densities': prob_densities.cpu(),
+            'candidates': all_candidates.cpu(),
+            'new': True if sample_new_only else next_idx < candidates.shape[0]
         }
 
     # new function for botorch acquisition
@@ -184,12 +271,15 @@ class ActiveLearningExperiment:
             acq_function=acq_func,
             bounds=bounds,
             q=1, # batch size 1
-            num_restarts=10, # restarts for non-convex acq optimization
+            return_best_only=False,
+            num_restarts=self.cfg["n_candidates"], # restarts for non-convex acq optimization
             raw_samples=200, # initialization samples
         )
         
-        x_next = candidates.detach() # detach from graph
-        return x_next, {'acq_val': _} # return candidate
+        # x_next = candidates.detach() # detach from graph
+        # return x_next, {'acq_val': _} # return candidate
+        return self._step_with_candidates(
+            iter_idx, candidates.detach().reshape(-1, self.cfg["dim"]), False)  # TODO: test True here
 
     def _step_optimizer(self, iter_idx):
         # precompute K_inv ONCE per iteration
@@ -219,7 +309,7 @@ class ActiveLearningExperiment:
             
             std = torch.sqrt(torch.clamp(var, min=1e-6))
             
-            energy = calculate_energy(mu, std, mode=self.cfg['energy_mode'])
+            energy = self.calculate_energy(mu, std)
             loss = energy.sum()
             loss.backward()
             optimizer.step()
@@ -237,7 +327,7 @@ class ActiveLearningExperiment:
             var = torch.diag(K_ss).view(-1, 1) - cov_term
             std = torch.sqrt(torch.clamp(var, min=1e-6))
             
-            energy = calculate_energy(mu, std, mode=self.cfg['energy_mode'])
+            energy = self.calculate_energy(mu, std)
             
             best_idx = torch.argmin(energy)
             # TODO; FIX: .detach() breaks the graph history
@@ -252,19 +342,6 @@ class ActiveLearningExperiment:
         # get history of samples
         # self.X_train contains all samples collected so far
         x_sampled = self.X_train.detach().cpu().numpy().ravel()
-        
-        # target energy density
-        # green curve
-        grid_res = 1000
-        x_grid = torch.linspace(self.bounds[0], self.bounds[1], grid_res).view(-1, 1)
-        y_grid_true = oracle_function(x_grid) 
-        
-        T = self.cfg['temperature']
-        logits = -y_grid_true / T  # boltzmann P(x) ~ exp(-E(x)/T)
-        probs = torch.nn.functional.softmax(logits, dim=0)
-        
-        dx = (self.bounds[1] - self.bounds[0]) / grid_res  # convert to density (prob/dx)
-        density_target = probs / dx                        # to match histogram scale
 
         plt.figure(figsize=(10, 6))
         
@@ -273,8 +350,16 @@ class ActiveLearningExperiment:
                  label=f'sampled X (history, N={len(x_sampled)})')
         
         # target density
-        plt.plot(x_grid.numpy(), density_target.numpy(), 'g-', linewidth=2, 
+        plt.plot(self.X_grid.numpy(), self.target_densities.numpy(), 'g-', linewidth=2, 
                  label=f'target density')
+        
+
+
+        kde = stats.gaussian_kde(self.X_train.T, bw_method="silverman")
+        kde_densities = kde.evaluate(self.X_grid.T)
+        plt.plot(self.X_grid.numpy(), kde_densities, 'b--', linewidth=2, label="empirical kde")
+
+
         
         plt.xlabel("input space x")
         plt.ylabel("prob density")
@@ -287,22 +372,23 @@ class ActiveLearningExperiment:
         plt.close()
 
     def _plot_iteration(self, iter_idx, debug_info):
-        X_grid = debug_info['X_grid']
-        mu = debug_info['mu_grid']
-        std = debug_info['std_grid']
-        densities = debug_info['densities_grid']
-        truth = oracle_function(X_grid)
+        X_grid = self.X_grid
+        mu = debug_info['mu']
+        std = debug_info['std']
+        densities = debug_info['densities']
+        # truth = oracle_function(X_grid)
+
         
-        # calculate true boltzmann density for comparison
-        energy_true = truth.view(-1)
-        logits_true = -energy_true / self.cfg['temperature']
-        probs_true = torch.nn.functional.softmax(logits_true, dim=0)
-        densities_true = probs_true / self.grid_vol
+        # # calculate true boltzmann density for comparison
+        # energy_true = truth.view(-1)
+        # logits_true = -energy_true / self.cfg['temperature']
+        # probs_true = torch.nn.functional.softmax(logits_true, dim=0)
+        # densities_true = probs_true / self.grid_vol
         
         plt.figure(figsize=(10, 8))
         
         plt.subplot(2, 1, 1)
-        plt.plot(X_grid.numpy(), truth.numpy(), 'k--', label="truth")
+        plt.plot(X_grid.numpy(), self.target_energies.numpy(), 'k--', label="truth")
         plt.plot(X_grid.numpy(), mu.numpy(), 'b-', label="gp mean")
         plt.fill_between(X_grid.view(-1).numpy(), 
                         (mu - 2*std).view(-1).numpy(), 
@@ -317,13 +403,59 @@ class ActiveLearningExperiment:
         plt.plot(X_grid.numpy(), densities.numpy(), 'r-', linewidth=2, label="model p(x)")
         plt.fill_between(X_grid.view(-1).numpy(), 0, densities.view(-1).numpy(), color='red', alpha=0.1)
         # plot true target density (green)
-        plt.plot(X_grid.numpy(), densities_true.numpy(), 'g--', linewidth=2, label="target p(x)")
+        plt.plot(X_grid.numpy(), self.target_densities.numpy(), 'g--', linewidth=2, label="target p(x)")
+        
+        
+        
+        kde = stats.gaussian_kde(self.X_train.T, bw_method="silverman")
+        kde_densities = kde.evaluate(self.X_grid.T)
+        plt.plot(X_grid.numpy(), kde_densities, 'b--', linewidth=2, label="empirical kde")
+
+        
         
         plt.ylabel("density")
         plt.xlabel("x")
         plt.legend()
         
         filename = os.path.join(self.cfg['output_dir'], f"iteration_{iter_idx:04d}.png")
+        plt.savefig(filename)
+        plt.close()
+
+    def _plot_rkl_loss(self, iter_idx):
+        # probs = self._get_probs(self.y_train)
+
+        # if len(self.X_train.shape) == 1:
+        #     empirical_probs = torch.histogram(self.X_train)
+        # else:
+        #     empirical_probs = torch.histogramdd(self.X_train)
+        # entropy = torch.distributions.Categorical.entropy(empirical_probs)
+        # n = self.y_train.shape[0]
+        # cross = torch.sum(torch.log(n * self.grid_vol * self.grid_vol * self.y_train)) / (n * self.grid_vol)
+        # return -entropy + cross
+
+        kde = stats.gaussian_kde(self.X_train.T, bw_method="silverman")
+        output = 0
+        for x, y in zip(self.X_train, self.y_train):  # TODO: can compute everything together, faster
+            p = torch.exp(-y) / self.Z
+            output += torch.log(kde.evaluate(x) / p)
+        output /= self.y_train.shape[0]
+        self.rkls_kde.append((iter_idx, output))
+
+        plt.figure(figsize=(10, 8))
+        plt.plot([item[0] for item in self.rkls_kde], [item[1] for item in self.rkls_kde], label="reverse kl (kde)")
+
+        # NOTE assuming a grid
+        if self.use_grid_sampling:
+            x_unique = torch.unique(self.X_train, return_counts=True, dim=0 if self.dim == 1 else 1)
+            print(f"shape of x_unique is {x_unique[0].shape} {x_unique[1].shape}")
+            dist = torch.distributions.Categorical(probs=x_unique[1])
+            entropy = dist.entropy()
+            rkl_grid = -entropy - torch.mean(self._get_log_probs(self.y_train, self.grid_vol))
+            self.rkls_grid.append((iter_idx, rkl_grid))
+            plt.plot([item[0] for item in self.rkls_grid], [item[1] for item in self.rkls_grid], label="reverse kl (grid)")
+
+        filename = os.path.join(self.cfg['output_dir'], f"rkl.png")
+        plt.legend()
         plt.savefig(filename)
         plt.close()
         
@@ -358,7 +490,7 @@ class ActiveLearningExperiment:
             var = torch.diag(K_ss).view(-1, 1) - cov_term
             std = torch.sqrt(torch.clamp(var, min=1e-6))
             
-            energy_vis = calculate_energy(mu, std, mode=self.cfg['energy_mode'])
+            energy_vis = self.calculate_energy(mu, std)
             
             ax_gp = axes[0, i]
             ax_gp.plot(linspace.numpy(), truth.numpy(), 'k--', label="truth")
@@ -474,7 +606,9 @@ if __name__ == "__main__":
         'n_iterations': 1000, 
         'temperature': 0.2,
         'noise_var': 0.1,
-        'energy_mode': 'LogEI' # TODO: from botorch mode
+        'energy_mode': 'LogEI', # TODO: rename to acquisi. func. to test botorch mode
+        'n_candidates': 0  # n_candidates = 0 means using grid
+        # TODO: add sampling_mode for _calculate_energy()
     }
     
     exp = ActiveLearningExperiment(config)
