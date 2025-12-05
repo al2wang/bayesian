@@ -61,6 +61,7 @@ class ActiveLearningExperiment:
         self.shape = (self.dim,)
         self.sampling_mode = config["sampling_mode"]
         self.n_candidates = config["n_candidates"]
+        self.use_grid_sampling = self.n_candidates == 0
 
         # b0 = torch.tensor(self.cfg["bounds"][0])
         # b1 = torch.tensor(self.cfg["bounds"][1])
@@ -88,11 +89,9 @@ class ActiveLearningExperiment:
         self.y_train = self.target.energy(self.X_train) + config['noise_var'] * torch.randn(n_initial, 1)
         self.history = []
 
-
         self.X_grid = None
         self.rkls_kde = []
         self.rkls_grid = []
-        self.use_grid_sampling = True
         
         # pre-compute ground truth energy distribution for comparison plots
         # sample a large batch to approximate the true distribution of f(x)
@@ -124,7 +123,6 @@ class ActiveLearningExperiment:
     def run(self):
         self._save_results(only_cfg=True)
         
-        self.use_grid_sampling = self.n_candidates == 0
         if self.use_grid_sampling:
             assert (self.dim <= 2)
             self._setup_grid()
