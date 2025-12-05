@@ -36,7 +36,7 @@ def rbf_kernel_torch(x1, x2, lengthscale=1.0, variance=1.0):
     sqdist = torch.cdist(x1, x2)**2
     return variance * torch.exp(-0.5 / lengthscale**2 * sqdist)
 
-def get_gp_posterior(X_train, y_train, X_test, lengthscale=1.0, noise_var=0.01):
+def get_gp_posterior(X_train, y_train, X_test, lengthscale, noise_var):
 
     # TODO: implement with botorch
 
@@ -62,6 +62,7 @@ class ActiveLearningExperiment:
         self.sampling_mode = config["sampling_mode"]
         self.n_candidates = config["n_candidates"]
         self.use_grid_sampling = self.n_candidates == 0
+        self.noise_var = config["noise_var"]
 
         # b0 = torch.tensor(self.cfg["bounds"][0])
         # b1 = torch.tensor(self.cfg["bounds"][1])
@@ -84,9 +85,8 @@ class ActiveLearningExperiment:
             self.target = target_class(dim=self.dim)
 
         n_initial = 50
-        print(self.shape, type(self.shape))
-        self.X_train = torch.rand(n_initial, *self.shape) * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
-        self.y_train = self.target.energy(self.X_train) + config['noise_var'] * torch.randn(n_initial, 1)
+        self.X_train = self.sample_domain_uniform(num=n_initial)
+        self.y_train = self.target.energy(self.X_train)
         self.history = []
 
         self.X_grid = None
@@ -143,16 +143,15 @@ class ActiveLearningExperiment:
                 # x_next, debug_info = self._step_acquisition(i)
                 x_next, debug_info = self._step_uniform(i)
             
-            y_next_true = self.target.energy(x_next)
-            y_next_obs = y_next_true + self.cfg['noise_var'] * torch.randn(1, 1)
+            y_next = self.target.energy(x_next)
             
             self.X_train = torch.cat([self.X_train, x_next], dim=0)
-            self.y_train = torch.cat([self.y_train, y_next_obs], dim=0)
+            self.y_train = torch.cat([self.y_train, y_next], dim=0)
             
             step_data = {
                 'iteration': i,
                 'x_next': x_next.clone(),
-                'y_next': y_next_obs.clone(),
+                'y_next': y_next.clone(),
                 **debug_info
             }
             self.history.append(step_data)
@@ -160,13 +159,13 @@ class ActiveLearningExperiment:
             if i % 10 == 0: # reduced print frequency for high-d loop
                 # plot the spatial view (grid or slices)
                 if self.dim == 1:
-                    print(f"iter {i}: sampled {x_next.numpy().ravel()} -> y={y_next_obs.item():.4f}")
+                    print(f"iter {i}: sampled {x_next.numpy().ravel()} -> y={y_next.item():.4f}")
                     self._plot_1d(i, debug_info)
                     # self._plot_empirical_distribution(i)
                 # elif self.dim == 2:  # TODO; double well plotting function
                 #     pass
                 else:
-                    print(f"iter {i}: sampled {x_next.numpy().ravel()[:3]}... -> y={y_next_obs.item():.4f}")
+                    print(f"iter {i}: sampled {x_next.numpy().ravel()[:3]}... -> y={y_next.item():.4f}")
                     # for botorch/high-d, calculate energy manually for slice visualization
                     self._plot_high_dim_slices(x_next.detach(), i, dims_to_plot=[0, 1] if self.dim > 1 else [0])
                 
@@ -234,7 +233,7 @@ class ActiveLearningExperiment:
         assert (list(candidates.shape)[1:] == list(self.shape))
 
         print(self.X_train.shape, self.y_train.shape, candidates.shape)
-        mu, var = get_gp_posterior(self.X_train, self.y_train, candidates)  # TODO: rewrite get_gp_posterior with botorch
+        mu, var = get_gp_posterior(self.X_train, self.y_train, candidates, lengthscale=1.0, noise_var=self.noise_var)  # TODO: rewrite get_gp_posterior with botorch
         all_candidates = candidates
         # if not sample_new_only:
             # mu = torch.concat([mu, self.y_train])
@@ -252,11 +251,9 @@ class ActiveLearningExperiment:
             'mu': mu.cpu(),
             'std': std.cpu(),
             'densities': prob_densities.cpu(),
-            'candidates': all_candidates.cpu(),
+            'candidates': all_candidates.cpu() if not self.use_grid_sampling else None,
             # 'new': True if sample_new_only else next_idx < candidates.shape[0]
         }
-
-
 
 
 
@@ -498,7 +495,7 @@ class ActiveLearningExperiment:
         
         N = self.X_train.shape[0]
         K = rbf_kernel_torch(self.X_train, self.X_train)
-        K_inv = torch.linalg.inv(K + self.cfg['noise_var'] * torch.eye(N))
+        K_inv = torch.linalg.inv(K + self.noise_var * torch.eye(N))
 
         for i, dim_idx in enumerate(dims_to_plot):
             x_slice = x_center.repeat(N_slice, 1) 
