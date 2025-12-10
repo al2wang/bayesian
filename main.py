@@ -124,7 +124,7 @@ class ActiveLearningExperiment:
         self._save_results(only_cfg=True)
         
         if self.use_grid_sampling:
-            assert (self.dim <= 2)
+            # assert (self.dim <= 2)    # TODO took out for testing higher dims
             self._setup_grid()
             self.target_energies = self.target.energy(self.X_grid)
             self.target_densities = self._get_probs(self.target_energies, self.grid_vol)
@@ -162,8 +162,14 @@ class ActiveLearningExperiment:
                     print(f"iter {i}: sampled {x_next.numpy().ravel()} -> y={y_next.item():.4f}")
                     self._plot_1d(i, debug_info)
                     # self._plot_empirical_distribution(i)
-                # elif self.dim == 2:  # TODO; double well plotting function
-                #     pass
+                
+                # TODO; double well plotting function
+                elif self.dim == 2:
+                    # use the new 2d plotting function for double well / 2d lj
+                    print(f"iter {i}: sampled {x_next.numpy().ravel()} -> y={y_next.item():.4f}")
+                    self._plot_2d(i, debug_info)
+
+
                 else:
                     print(f"iter {i}: sampled {x_next.numpy().ravel()[:3]}... -> y={y_next.item():.4f}")
                     # for botorch/high-d, calculate energy manually for slice visualization
@@ -175,18 +181,32 @@ class ActiveLearningExperiment:
         self._save_results()
 
     def _setup_grid(self):
-        self.n_grid = self.cfg['n_grid']
-        linspace = torch.linspace(self.bounds[0], self.bounds[1], self.n_grid)
+        # self.n_grid = self.cfg['n_grid']
+        # linspace = torch.linspace(self.bounds[0], self.bounds[1], self.n_grid)
         
-        if self.dim == 1:
-            self.X_grid = linspace.view(-1, 1)
-            self.grid_vol = (self.bounds[1] - self.bounds[0]) / self.n_grid
-        else:
-            x = torch.linspace(self.bounds[0], self.bounds[1], int(np.sqrt(self.n_grid)))
-            grid = torch.meshgrid([x, x], indexing='ij')
-            self.X_grid = torch.stack(grid, dim=-1).reshape(-1, 2)
-            side_len = (self.bounds[1] - self.bounds[0]) / int(np.sqrt(self.n_grid))
-            self.grid_vol = side_len ** 2
+        # if self.dim == 1:
+        #     self.X_grid = linspace.view(-1, 1)
+        #     self.grid_vol = (self.bounds[1] - self.bounds[0]) / self.n_grid
+        # else:
+        #     x = torch.linspace(self.bounds[0], self.bounds[1], int(np.sqrt(self.n_grid)))
+        #     grid = torch.meshgrid([x, x], indexing='ij')
+        #     self.X_grid = torch.stack(grid, dim=-1).reshape(-1, 2)
+        #     side_len = (self.bounds[1] - self.bounds[0]) / int(np.sqrt(self.n_grid))
+        #     self.grid_vol = side_len ** 2
+
+
+        # calculate points per dimension to approximate total n_grid
+        pts_per_dim = int(self.cfg['n_grid'] ** (1 / self.dim))        
+        ranges = [torch.linspace(self.bounds[0], self.bounds[1], pts_per_dim) for _ in range(self.dim)]
+        grids = torch.meshgrid(*ranges, indexing='ij')
+        # stack and flatten: (n_points, dim)
+        self.X_grid = torch.stack(grids, dim=-1).reshape(-1, self.dim)
+        self.n_grid = self.X_grid.shape[0]
+        side_len = (self.bounds[1] - self.bounds[0]) / pts_per_dim
+        self.grid_vol = side_len ** self.dim
+        
+        print(f"setup grid: dim={self.dim}, pts_per_dim={pts_per_dim}, total_pts={self.n_grid}, grid_vol={self.grid_vol:.4e}")
+
 
     def _step_grid(self, iter_idx):
         return self._step_with_candidates(iter_idx, self.X_grid.reshape(-1, *self.shape))
@@ -442,7 +462,70 @@ class ActiveLearningExperiment:
         plt.savefig(filename)
         plt.close()
 
+
+
+
+    def _plot_2d(self, iter_idx, debug_info):        
+        if self.X_grid is None: # cannot do contour plot without grid
+            return
+        pts_per_dim = int(self.n_grid ** 0.5)   # assumes square grid setup in _setup_grid        
+        X = self.X_grid[:, 0].view(pts_per_dim, pts_per_dim).numpy()
+        Y = self.X_grid[:, 1].view(pts_per_dim, pts_per_dim).numpy()
+        
+        # clamp energy for visualization: lj/double well can be very high at walls
+        # clip top 5% of energy values to keep contrast on minima
+        truth = self.target_energies.view(pts_per_dim, pts_per_dim).numpy()
+        vmax = np.percentile(truth, 95) 
+        
+        mu = debug_info['mu'].view(pts_per_dim, pts_per_dim).numpy()
+        densities = debug_info['densities'].view(pts_per_dim, pts_per_dim).numpy()
+        
+        # training points
+        train_x = self.X_train.numpy()
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        
+        # 1. truth energy
+        # use contourf with clipped vmax
+        c1 = axes[0].contourf(X, Y, truth, levels=50, cmap='viridis', vmax=vmax)
+        axes[0].scatter(train_x[:, 0], train_x[:, 1], c='white', s=10, edgecolors='black', alpha=0.6)
+        axes[0].set_title("true energy")
+        plt.colorbar(c1, ax=axes[0])
+        
+        # 2. gp mean
+        c2 = axes[1].contourf(X, Y, mu, levels=50, cmap='viridis', vmax=vmax)
+        axes[1].scatter(train_x[:, 0], train_x[:, 1], c='white', s=10, edgecolors='black', alpha=0.6)
+        axes[1].set_title("GP mean prediction")
+        plt.colorbar(c2, ax=axes[1])
+        
+        # 3. density
+        c3 = axes[2].contourf(X, Y, densities, levels=50, cmap='magma')
+        axes[2].scatter(train_x[:, 0], train_x[:, 1], c='cyan', s=10, edgecolors='black', alpha=0.6)
+        axes[2].set_title("sampling density p(x)")
+        plt.colorbar(c3, ax=axes[2])
+        
+        plt.suptitle(f"iter {iter_idx}: 2d energy")
+        filename = os.path.join(self.cfg['output_dir'], f"plot_2d_{iter_idx:04d}.png")
+        plt.savefig(filename)
+        plt.close()
+
+
+
+
+
+
     def _plot_rkl_loss(self, iter_idx):
+
+
+
+        if self.dim > 2 and not self.use_grid_sampling:
+             # kde fails in very high dim with few points usually
+             # return early or implement robust fallback
+             return
+        
+
+
+
         # probs = self._get_probs(self.y_train)
 
         # if len(self.X_train.shape) == 1:
@@ -630,7 +713,7 @@ class ActiveLearningExperiment:
 
 def main(
         target_name="toy_sin_cos",
-        dim=1, # TODO use dim 5 for high d testing
+        dim=2, # TODO use dim 5 for high d testing
         output_dir="experiments",
         seed=42,
         bounds=[-2.5, 2.5],

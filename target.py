@@ -26,6 +26,26 @@ class ToySinCosEnergy(Energy):
     def _energy(self, x):  # x: (Batch, Dim)
         return torch.sum(torch.sin(x) * torch.cos(x), dim=1, keepdim=True)
     
+
+
+
+class WrappedDoubleWell(DoubleWellEnergy):
+    def __init__(self, dim=2, a=0, b=-4.0, c=1.0):
+        # bgflow double well is inherently 2d or higher, usually visualized in 2d
+        super().__init__(dim=dim, a=a, b=b, c=c)
+
+class WrappedLennardJones(LennardJonesPotential):
+    def __init__(self, dim, n_particles=None, **kwargs):
+        # if dim is passed but n_particles not, infer particles (assuming 2d or 3d world?)
+        # usually lj is 3d, so dim = n_particles * 3
+        if n_particles is None:
+            # fallback assumption: 2d space
+            n_particles = dim // 2 
+        super().__init__(n_particles=n_particles, dim=dim, **kwargs)
+
+
+
+
 TARGETS_DICT = {
     "toy_sin_cos": ToySinCosEnergy,
     "double_well": DoubleWellEnergy,
