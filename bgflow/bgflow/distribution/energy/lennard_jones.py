@@ -57,9 +57,25 @@ class LennardJonesPotential(Energy):
         lj_energies = lennard_jones_energy_torch(dists, self._eps, self._rm)
         lj_energies = lj_energies.view(*batch_shape, -1).sum(dim=-1) / 2
 
+
+
+        # if self.oscillator:
+        #     osc_energies = 0.5 * self._remove_mean(x).pow(2).sum(dim=(-2, -1)).view(*batch_shape)
+        #     lj_energies = lj_energies + osc_energies * self._oscillator_scale
+
         if self.oscillator:
-            osc_energies = 0.5 * self._remove_mean(x).pow(2).sum(dim=(-2, -1)).view(*batch_shape)
+            # MODIFIED: Robust view for scalar/empty batch shape
+            osc_raw = 0.5 * self._remove_mean(x).pow(2).sum(dim=(-2, -1))
+            
+            # If batch_shape is empty (scalar result), view(*) fails.
+            if len(batch_shape) == 0:
+                 osc_energies = osc_raw # keep as scalar/0-d tensor
+            else:
+                 osc_energies = osc_raw.view(*batch_shape)
+                 
             lj_energies = lj_energies + osc_energies * self._oscillator_scale
+
+
 
         return lj_energies[:, None]
 

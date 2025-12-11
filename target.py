@@ -31,23 +31,23 @@ class ToySinCosEnergy(Energy):
 
 class WrappedDoubleWell(DoubleWellEnergy):
     def __init__(self, dim=2, a=0, b=-4.0, c=1.0):
-        # bgflow double well is inherently 2d or higher, usually visualized in 2d
         super().__init__(dim=dim, a=a, b=b, c=c)
 
 class WrappedLennardJones(LennardJonesPotential):
     def __init__(self, dim, n_particles=None, **kwargs):
-        # if dim is passed but n_particles not, infer particles (assuming 2d or 3d world?)
-        # usually lj is 3d, so dim = n_particles * 3
         if n_particles is None:
-            # fallback assumption: 2d space
-            n_particles = dim // 2 
-        super().__init__(n_particles=n_particles, dim=dim, **kwargs)
+            n_particles = dim // 2 # assumption if not provided
+        
+        # MODIFIED: two_event_dims=False
+        # This ensures the Energy class treats input as flat (N, dim) rather than (N, particles, space)
+        # and handles the reshaping internally or allows the GP to pass flat vectors without error.
+        super().__init__(n_particles=n_particles, dim=dim, two_event_dims=False, **kwargs)
 
 
 
 
 TARGETS_DICT = {
     "toy_sin_cos": ToySinCosEnergy,
-    "double_well": DoubleWellEnergy,
-    "lennard_jones": LennardJonesPotential
+    "double_well": WrappedDoubleWell,
+    "lennard_jones": WrappedLennardJones
 }
