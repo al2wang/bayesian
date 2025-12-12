@@ -113,7 +113,7 @@ class ActiveLearningExperiment:
                 # assuming .npy file [N_samples, Dim] or [N_samples, Particles, 3]
                 gt_data = np.load(config["gt_data_path"])
                 self.X_gt = torch.tensor(gt_data, dtype=torch.float32).reshape(-1, self.dim)
-                # compute GT energies once
+                # compute ground truth energies once
                 self.y_gt = self.target.energy(self.X_gt).detach().numpy().ravel()
             except Exception as e:
                 print(f"failed to load GT data: {e}")
@@ -124,6 +124,20 @@ class ActiveLearningExperiment:
         #     print("Warning: No Ground Truth data provided. Using random samples as 'Truth' (inaccurate for LJ13).")
         #     self.X_gt = self.sample_domain_uniform(num=5000)
         #     self.y_gt = self.target.energy(self.X_gt).detach().numpy().ravel()
+
+        # TODO is this really needed?
+        self.X_bgflow = None
+        if config["bgflow_data_path"] and os.path.exists(config["bgflow_data_path"]):
+            try:
+                print(f"Loading BGflow baseline data from {config['bgflow_data_path']}...")
+                bg_data = np.load(config["bgflow_data_path"])
+                # Ensure correct shape (N, dim)
+                self.X_bgflow = torch.tensor(bg_data, dtype=torch.float32).reshape(-1, self.dim)
+                # Compute energies using OUR potential function to ensure fair comparison
+                self.y_bgflow = self.target.energy(self.X_bgflow).detach().numpy().ravel()
+            except Exception as e:
+                print(f"Failed to load BGflow data: {e}")
+
 
         os.makedirs(config['output_dir'], exist_ok=True)
 
@@ -176,7 +190,7 @@ class ActiveLearningExperiment:
             if i % 10 == 0: 
                 # LJ13 Specific Plotting
                 if self.cfg["target_name"] == "lennard_jones":
-                    print(f"iter {i}: sampled energy -> y={y_next.item():.4f}")
+                    print(f"iter {i}: sampled energy y={y_next.item():.4f}")
                     self._plot_lj13_metrics(i)
                 
                 # Standard Dimensional Plotting
@@ -262,6 +276,10 @@ class ActiveLearningExperiment:
 
 
     def _plot_lj13_metrics(self, iter_idx):
+        # GROUND TRUTH - gray
+        # ACTIVE SAMPLES - red
+        # BGFLOW SAMPLES - blue
+
         # plots histograms for (1) potential energy and (2) interatomic distances
         # filters NaN/Inf and clips extreme outliers for visibility
 
@@ -282,6 +300,25 @@ class ActiveLearningExperiment:
         dists_gen = compute_pairwise_distances(X_gen_clean, self.n_particles, n_dims=3).numpy()
         dists_gt = compute_pairwise_distances(self.X_gt, self.n_particles, n_dims=3).numpy()
         
+
+
+
+        # prepare bgflow
+        y_bg_clean = np.array([])
+        dists_bg = np.array([])
+        
+        if self.X_bgflow is not None:
+            y_bg_raw = self.y_bgflow
+            valid_bg = np.isfinite(y_bg_raw)
+            y_bg_clean = y_bg_raw[valid_bg]
+            X_bg_clean = self.X_bgflow[torch.tensor(valid_bg)]
+            
+            if len(y_bg_clean) > 0:
+                dists_bg = compute_pairwise_distances(X_bg_clean, self.n_particles, n_dims=3).numpy()
+
+
+
+
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
         
         # NOTE: DETERMINE ROBUST RANGE FOR ENERGY
@@ -305,8 +342,12 @@ class ActiveLearningExperiment:
         lower_bound = min(gt_min, gen_min) - 5
         
         # plot #1 potential energy distribution
-        axes[0].hist(y_gt, bins=50, density=True, alpha=0.5, color='gray', label='ground truth')
-        axes[0].hist(y_gen_clean, bins=50, density=True, alpha=0.5, color='red', 
+        axes[0].hist(y_gt, bins=50, density=True, alpha=0.6, color='gray', label='ground truth (MCMC)')
+        if len(y_bg_clean) > 0:
+            axes[0].hist(y_bg_clean, bins=50, density=True, alpha=0.5, color='blue', 
+                         range=(lower_bound, upper_bound),
+                         label=f'BGflow (N={len(y_bg_clean)})')
+        axes[0].hist(y_gen_clean, bins=50, density=True, alpha=0.4, color='red', 
                      range=(lower_bound, upper_bound),
                      label=f'active samples (N={len(y_gen_clean)})')
         axes[0].set_xlabel("Potential Energy")
@@ -321,8 +362,10 @@ class ActiveLearningExperiment:
         #                  transform=axes[0].transAxes, color='red', ha='center')
 
         # plot #2 interatomic distance distribution
-        axes[1].hist(dists_gt, bins=50, density=True, alpha=0.5, color='gray', label='ground truth')
-        axes[1].hist(dists_gen, bins=50, density=True, alpha=0.5, color='blue', label='active samples')
+        axes[1].hist(dists_gt, bins=50, density=True, alpha=0.6, color='gray', label='ground truth')
+        if len(dists_bg) > 0:
+            axes[1].hist(dists_bg, bins=50, density=True, alpha=0.5, color='blue', label='BGflow')
+        axes[1].hist(dists_gen, bins=50, density=True, alpha=0.4, color='red', label='active samples')
         axes[1].set_xlabel("interatomic distance")
         axes[1].set_ylabel("normalized density")
         axes[1].set_title("interatomic distances")
@@ -548,7 +591,8 @@ def main(
         sampling_mode="posterior",
         n_candidates=1000,  # NOTE: use random candidates for high dim; grid fails > 3D
         lj_n_particles=13,
-        gt_data_path="./pita/data/lj13/LJ13_temp_3.0/train_split_LJ13-10000.npy"
+        gt_data_path="./pita/data/lj13/LJ13_temp_3.0/train_split_LJ13-10000.npy",
+        bgflow_data_path="experiments/bgflow_lj13/bgflow_samples.npy" 
     ):
     config = {
         'git_hash': get_git_short_hash(),
@@ -564,7 +608,8 @@ def main(
         'n_candidates': n_candidates, 
         'target_name': target_name,
         'lj_n_particles': lj_n_particles,
-        'gt_data_path': gt_data_path
+        'gt_data_path': gt_data_path,
+        'bgflow_data_path': bgflow_data_path
     }
 
     print(config)
