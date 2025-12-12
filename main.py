@@ -47,6 +47,26 @@ def get_gp_posterior(X_train, y_train, X_test, lengthscale, noise_var):
     var = torch.diag(cov).view(-1, 1)
     return mu, var
 
+
+def compute_pairwise_distances(x, n_particles, n_dims=3):
+    """
+    compute all pairwise distances for a batch of states.
+    x: (N, n_particles * n_dims) flat tensor
+    returns: (N * n_pairs) flat tensor of all distances
+    """
+    x_reshaped = x.view(-1, n_particles, n_dims)    # reshape to (N, particles, coords)
+    dists = torch.cdist(x_reshaped, x_reshaped, p=2)    # compute pairwise distance matrix (N, P, P)
+    triu_indices = torch.triu_indices(
+        n_particles,
+        n_particles,
+        offset=1
+    )   # extract upper triangle indices (excluding diagonal) to avoid duplicates and zeros
+    pairwise_dists = dists[:, triu_indices[0], triu_indices[1]] # gather distances, result is (N, n_pairs)
+    
+    return pairwise_dists.flatten()
+
+
+
 class ActiveLearningExperiment:
     def __init__(self, config):
         self.cfg = config
@@ -61,10 +81,19 @@ class ActiveLearningExperiment:
 
         target_class = TARGETS_DICT[config["target_name"]]
         if config["target_name"] == "lennard_jones":
-            n_particles = config["lj_n_particles"]
-            self.target = target_class(dim=self.dim, n_particles=n_particles)
+            self.n_particles = config["lj_n_particles"]            
+            # pass physical constants (eps=2.0, rm=1.0)
+            self.target = target_class(
+                dim=self.dim, 
+                n_particles=self.n_particles, 
+                eps=2.0, 
+                rm=1.0, 
+                oscillator=True,
+                oscillator_scale=1.0
+            )
         else:
             self.target = target_class(dim=self.dim)
+            self.n_particles = None
 
         n_initial = 50
         self.X_train = self.sample_domain_uniform(num=n_initial)
@@ -74,8 +103,28 @@ class ActiveLearningExperiment:
         self.X_grid = None
         self.rkls_kde = []
         self.rkls_grid = []
-        self.log_Z = 0.0 # Store log_Z instead of Z for stability
+        self.log_Z = 0.0
         
+        # load ground truth data for plotting (if available)
+        self.X_gt = None
+        if config["gt_data_path"] and os.path.exists(config["gt_data_path"]):
+            try:
+                print(f"Loading ground truth data from {config['gt_data_path']}...")
+                # assuming .npy file [N_samples, Dim] or [N_samples, Particles, 3]
+                gt_data = np.load(config["gt_data_path"])
+                self.X_gt = torch.tensor(gt_data, dtype=torch.float32).reshape(-1, self.dim)
+                # compute GT energies once
+                self.y_gt = self.target.energy(self.X_gt).detach().numpy().ravel()
+            except Exception as e:
+                print(f"failed to load GT data: {e}")
+        
+        # # if no GT data provided, we cannot plot accurate ground truth comparisons 
+        # # for high-D LJ13; initialize placeholders in this case
+        # if self.X_gt is None:
+        #     print("Warning: No Ground Truth data provided. Using random samples as 'Truth' (inaccurate for LJ13).")
+        #     self.X_gt = self.sample_domain_uniform(num=5000)
+        #     self.y_gt = self.target.energy(self.X_gt).detach().numpy().ravel()
+
         os.makedirs(config['output_dir'], exist_ok=True)
 
     def sample_domain_uniform(self, num=1):
@@ -125,15 +174,18 @@ class ActiveLearningExperiment:
             self.history.append(step_data)
             
             if i % 10 == 0: 
-                if self.dim == 1:
-                    print(f"iter {i}: sampled {x_next.numpy().ravel()} -> y={y_next.item():.4f}")
+                # LJ13 Specific Plotting
+                if self.cfg["target_name"] == "lennard_jones":
+                    print(f"iter {i}: sampled energy -> y={y_next.item():.4f}")
+                    self._plot_lj13_metrics(i)
+                
+                # Standard Dimensional Plotting
+                elif self.dim == 1:
                     self._plot_1d(i, debug_info)
                 elif self.dim == 2:
-                    print(f"iter {i}: sampled {x_next.numpy().ravel()} -> y={y_next.item():.4f}")
                     self._plot_2d(i, debug_info)
                 else:
-                    print(f"iter {i}: sampled {x_next.numpy().ravel()[:3]}... -> y={y_next.item():.4f}")
-                    self._plot_high_dim_slices(x_next.detach(), i, dims_to_plot=[0, 1] if self.dim > 1 else [0])
+                    self._plot_high_dim_slices(x_next.detach(), i)
                 
                 self._plot_rkl_loss(i)
 
@@ -149,10 +201,8 @@ class ActiveLearningExperiment:
         self.grid_vol = side_len ** self.dim
         
         print(f"setup grid: dim={self.dim}, pts_per_dim={pts_per_dim}, total_pts={self.n_grid}, grid_vol={self.grid_vol:.4e}")
-        
-        # WARNING for pigeons
         if pts_per_dim == 2 and self.dim > 5:
-            print("WARNING: Grid resolution is extremely low (2 pts/dim). High energy collisions guaranteed.")
+            print("WARNING: Grid resolution is extremely low (2 pts/dim).")
 
     def _step_grid(self, iter_idx):
         return self._step_with_candidates(iter_idx, self.X_grid.reshape(-1, *self.shape))
@@ -185,7 +235,6 @@ class ActiveLearningExperiment:
         
         # logsumexp(logits) - log(N)
         log_Z = torch.logsumexp(logits, dim=0) - math.log(logits.shape[0])
-        print(f"this is log_Z={log_Z.item()}")
         return log_Z
 
     def _step_uniform(self, iter_idx):
@@ -210,6 +259,81 @@ class ActiveLearningExperiment:
             'densities': prob_densities.cpu(),
             'candidates': all_candidates.cpu() if not self.use_grid_sampling else None,
         }
+
+
+    def _plot_lj13_metrics(self, iter_idx):
+        # plots histograms for (1) potential energy and (2) interatomic distances
+        # filters NaN/Inf and clips extreme outliers for visibility
+
+        X_gen = self.X_train.detach() 
+        y_gen = self.y_train.detach().numpy().ravel()
+        
+        valid_indices = np.isfinite(y_gen)
+        y_gen_clean = y_gen[valid_indices]
+        X_gen_clean = X_gen[torch.tensor(valid_indices)]
+        
+        if len(y_gen_clean) == 0:
+            print("Warning: All generated energies are NaN/Inf. Skipping plot.")
+            return
+
+        y_gt = self.y_gt[np.isfinite(self.y_gt)]
+        
+        # compute distance
+        dists_gen = compute_pairwise_distances(X_gen_clean, self.n_particles, n_dims=3).numpy()
+        dists_gt = compute_pairwise_distances(self.X_gt, self.n_particles, n_dims=3).numpy()
+        
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        
+        # NOTE: DETERMINE ROBUST RANGE FOR ENERGY
+        # Focus on the Ground Truth range, but extend slightly to show near-misses.
+        # If generated samples are ALL way off (e.g. > 1e10), we still want to show them 
+        # (or show that they are off scale), but we must not let 1e30 ruin the plot for GT.
+        # Heuristic: use [min(GT), max(GT) + padding] OR [min(GT), percentile_90(Gen)]
+        # We cap the view at a "reasonable" high energy (e.g., 200) or relative to GT range.
+        
+        gt_min, gt_max = y_gt.min(), y_gt.max()
+        gen_min, gen_max = y_gen_clean.min(), y_gen_clean.max()
+        
+        # Use 95th percentile of GEN data to set upper bound, but clamp to avoid 1e30
+        # If all data is 1e30, this percentile will still be high. 
+        # So we take min(percentile, gt_max + 500) to keep plot readable.
+        
+        gen_p95 = np.percentile(y_gen_clean, 95)
+        # Dynamic upper bound: Show GT, plus some of the "better" generated samples
+        # If gen samples are huge, we cut them off visually so we can see the GT bins.
+        upper_bound = max(gt_max + 50, min(gen_p95, gt_max + 1000))
+        lower_bound = min(gt_min, gen_min) - 5
+        
+        # plot #1 potential energy distribution
+        axes[0].hist(y_gt, bins=50, density=True, alpha=0.5, color='gray', label='ground truth')
+        axes[0].hist(y_gen_clean, bins=50, density=True, alpha=0.5, color='red', 
+                     range=(lower_bound, upper_bound),
+                     label=f'active samples (N={len(y_gen_clean)})')
+        axes[0].set_xlabel("Potential Energy")
+        axes[0].set_ylabel("Normalized Density")
+        axes[0].set_title(f"Iter {(iter_idx)}: Energy (View Range: [{lower_bound:.1f}, {upper_bound:.1f}])")
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+        
+        # # warn if huge clipping occurred
+        # if gen_max > upper_bound:
+        #     axes[0].text(0.5, 0.9, f"Max Energy: {gen_max:.1e} (Clipped)", 
+        #                  transform=axes[0].transAxes, color='red', ha='center')
+
+        # plot #2 interatomic distance distribution
+        axes[1].hist(dists_gt, bins=50, density=True, alpha=0.5, color='gray', label='ground truth')
+        axes[1].hist(dists_gen, bins=50, density=True, alpha=0.5, color='blue', label='active samples')
+        axes[1].set_xlabel("interatomic distance")
+        axes[1].set_ylabel("normalized density")
+        axes[1].set_title("interatomic distances")
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        filename = os.path.join(self.cfg['output_dir'], f"lj13_metrics_{iter_idx:04d}.png")
+        plt.savefig(filename)
+        plt.close()
+
 
     def _plot_1d(self, iter_idx, debug_info):
         X_grid = self.X_grid
@@ -333,12 +457,9 @@ class ActiveLearningExperiment:
     def _plot_high_dim_slices(self, x_center, iter_idx, dims_to_plot=[0, 1, 2]):
         n_plots = len(dims_to_plot)
         fig, axes = plt.subplots(2, n_plots, figsize=(4 * n_plots, 6), sharex='col')
-        if n_plots == 1:
-            axes = axes.reshape(2, 1) 
-            
+        if n_plots == 1: axes = axes.reshape(2, 1) 
         N_slice = 200
         linspace = torch.linspace(self.bounds[0], self.bounds[1], N_slice)
-        
         N = self.X_train.shape[0]
         K = rbf_kernel_torch(self.X_train, self.X_train)
         K_inv = torch.linalg.inv(K + self.noise_var * torch.eye(N))
@@ -404,7 +525,6 @@ class ActiveLearningExperiment:
             json.dump(self.cfg, f, indent=4, default=str)
         
         if only_cfg: return
-            
         data_path = os.path.join(folder, f"data_{timestamp}.pt")
         save_dict = {
             'X_train': self.X_train,
@@ -416,18 +536,19 @@ class ActiveLearningExperiment:
         print(f"Experiment saved to {folder}")
 
 def main(
-        target_name="double_well",
-        dim=3, 
+        target_name="lennard_jones",
+        dim=39, # for lj13, 13 particles * 3 dims = 39
         output_dir="experiments",
-        seed=42,
+        seed=100,
         bounds=[-2.5, 2.5],
         n_grid=5000,
         n_iterations=1000, 
-        temperature=0.2,
-        noise_var =0.1,
+        temperature=2.0,
+        noise_var =0.2,
         sampling_mode="posterior",
-        n_candidates=0,  
+        n_candidates=1000,  # NOTE: use random candidates for high dim; grid fails > 3D
         lj_n_particles=13,
+        gt_data_path="./pita/data/lj13/LJ13_temp_3.0/train_split_LJ13-10000.npy"
     ):
     config = {
         'git_hash': get_git_short_hash(),
@@ -443,6 +564,7 @@ def main(
         'n_candidates': n_candidates, 
         'target_name': target_name,
         'lj_n_particles': lj_n_particles,
+        'gt_data_path': gt_data_path
     }
 
     print(config)
