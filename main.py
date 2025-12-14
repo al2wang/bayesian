@@ -125,7 +125,6 @@ class ActiveLearningExperiment:
         #     self.X_gt = self.sample_domain_uniform(num=5000)
         #     self.y_gt = self.target.energy(self.X_gt).detach().numpy().ravel()
 
-        # TODO is this really needed?
         self.X_bgflow = None
         if config["bgflow_data_path"] and os.path.exists(config["bgflow_data_path"]):
             try:
@@ -137,6 +136,18 @@ class ActiveLearningExperiment:
                 self.y_bgflow = self.target.energy(self.X_bgflow).detach().numpy().ravel()
             except Exception as e:
                 print(f"Failed to load BGflow data: {e}")
+
+        self.X_pita = None
+        self.y_pita = None
+        if config.get("pita_data_path") and os.path.exists(config["pita_data_path"]):
+            try:
+                print(f"Loading PITA baseline data from {config['pita_data_path']}...")
+                pita_data = np.load(config["pita_data_path"])
+                self.X_pita = torch.tensor(pita_data, dtype=torch.float32).reshape(-1, self.dim)
+                self.y_pita = self.target.energy(self.X_pita).detach().numpy().ravel()
+            except Exception as e:
+                print(f"failed to load PITA data: {e}")
+
 
 
         os.makedirs(config['output_dir'], exist_ok=True)
@@ -306,17 +317,24 @@ class ActiveLearningExperiment:
         # prepare bgflow
         y_bg_clean = np.array([])
         dists_bg = np.array([])
-        
         if self.X_bgflow is not None:
             y_bg_raw = self.y_bgflow
             valid_bg = np.isfinite(y_bg_raw)
             y_bg_clean = y_bg_raw[valid_bg]
             X_bg_clean = self.X_bgflow[torch.tensor(valid_bg)]
-            
             if len(y_bg_clean) > 0:
                 dists_bg = compute_pairwise_distances(X_bg_clean, self.n_particles, n_dims=3).numpy()
 
 
+        y_pita_clean = np.array([])
+        dists_pita = np.array([])
+        if self.X_pita is not None:
+            y_pita_raw = self.y_pita
+            valid_pita = np.isfinite(y_pita_raw)
+            y_pita_clean = y_pita_raw[valid_pita]
+            X_pita_clean = self.X_pita[torch.tensor(valid_pita)]
+            if len(y_pita_clean) > 0:
+                dists_pita = compute_pairwise_distances(X_pita_clean, self.n_particles, n_dims=3).numpy()
 
 
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
@@ -347,7 +365,11 @@ class ActiveLearningExperiment:
             axes[0].hist(y_bg_clean, bins=50, density=True, alpha=0.5, color='blue', 
                          range=(lower_bound, upper_bound),
                          label=f'BGflow (N={len(y_bg_clean)})')
-        axes[0].hist(y_gen_clean, bins=50, density=True, alpha=0.4, color='red', 
+        if len(y_pita_clean) > 0:
+            axes[0].hist(y_pita_clean, bins=50, density=True, alpha=0.4, color='green',
+                         range=(lower_bound, upper_bound),
+                         label='PITA (annealed)')
+        axes[0].hist(y_gen_clean, bins=50, density=True, alpha=0.3, color='red', 
                      range=(lower_bound, upper_bound),
                      label=f'active samples (N={len(y_gen_clean)})')
         axes[0].set_xlabel("Potential Energy")
@@ -365,7 +387,9 @@ class ActiveLearningExperiment:
         axes[1].hist(dists_gt, bins=50, density=True, alpha=0.6, color='gray', label='ground truth')
         if len(dists_bg) > 0:
             axes[1].hist(dists_bg, bins=50, density=True, alpha=0.5, color='blue', label='BGflow')
-        axes[1].hist(dists_gen, bins=50, density=True, alpha=0.4, color='red', label='active samples')
+        if len(dists_pita) > 0:
+            axes[1].hist(dists_pita, bins=50, density=True, alpha=0.4, color='green', label='PITA')
+        axes[1].hist(dists_gen, bins=50, density=True, alpha=0.3, color='red', label='active samples')
         axes[1].set_xlabel("interatomic distance")
         axes[1].set_ylabel("normalized density")
         axes[1].set_title("interatomic distances")
@@ -585,14 +609,15 @@ def main(
         seed=100,
         bounds=[-2.5, 2.5],
         n_grid=5000,
-        n_iterations=1000, 
+        n_iterations=10000, 
         temperature=2.0,
         noise_var =0.2,
         sampling_mode="posterior",
         n_candidates=1000,  # NOTE: use random candidates for high dim; grid fails > 3D
         lj_n_particles=13,
         gt_data_path="./pita/data/lj13/LJ13_temp_3.0/train_split_LJ13-10000.npy",
-        bgflow_data_path="experiments/bgflow_lj13/bgflow_samples.npy" 
+        bgflow_data_path="experiments/bgflow_lj13/bgflow_samples.npy",
+        pita_data_path="experiments/pita_lj13/pita_samples.npy"
     ):
     config = {
         'git_hash': get_git_short_hash(),
@@ -609,7 +634,8 @@ def main(
         'target_name': target_name,
         'lj_n_particles': lj_n_particles,
         'gt_data_path': gt_data_path,
-        'bgflow_data_path': bgflow_data_path
+        'bgflow_data_path': bgflow_data_path,
+        'pita_data_path': pita_data_path
     }
 
     print(config)
