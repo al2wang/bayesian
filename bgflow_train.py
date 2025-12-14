@@ -18,12 +18,12 @@ from target import TARGETS_DICT
 def train_bgflow(
     n_particles=13,
     dim=39,
-    n_training_steps=2000,
+    n_training_steps=10000,
     batch_size=128,
     lr=1e-3,
-    temperature=2.0,
+    temperature=1.0,
     output_dir="experiments/bgflow_lj13",
-    n_samples_to_save=5000
+    n_samples_to_save=10000
 ):
     """
     Trains a Boltzmann Generator (Normalizing Flow) on LJ13 potential
@@ -134,7 +134,7 @@ def train_bgflow(
         samples = generator.sample(n_samples_to_save)
         samples_np = samples.cpu().numpy()
     
-    save_path = os.path.join(output_dir, "bgflow_samples.npy")
+    save_path = os.path.join(output_dir, "bgflow_samples_T1.0.npy")
     np.save(save_path, samples_np)
     print(f"samples saved to {save_path}")
 

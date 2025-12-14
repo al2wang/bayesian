@@ -9,16 +9,20 @@ from datetime import datetime
 from pathlib import Path
 import math
 
-from target import TARGETS_DICT
-
-# new imports for botorch logic
 from botorch.models import SingleTaskGP 
 from botorch.fit import fit_gpytorch_mll 
-from gpytorch.mlls import ExactMarginalLogLikelihood 
 from botorch.acquisition import ExpectedImprovement, UpperConfidenceBound, LogExpectedImprovement 
 from botorch.optim import optimize_acqf 
 
+import gpytorch
+from gpytorch.mlls import ExactMarginalLogLikelihood
+from gpytorch.kernels import MaternKernel, RBFKernel, ScaleKernel
+from gpytorch.priors import GammaPrior
+
 from scipy import stats
+
+from target import TARGETS_DICT
+PLOT_BASELINES = False
 
 # util for config/versioning
 def get_git_short_hash():
@@ -71,13 +75,22 @@ class ActiveLearningExperiment:
     def __init__(self, config):
         self.cfg = config
         torch.manual_seed(config['seed'])
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.t_dtype = torch.float64    # NOTE: double precision for BoTorch stability
+        print(f"running on {self.device} with {self.t_dtype}")
+
         self.dim = config['dim']
         self.shape = (self.dim,) 
         self.sampling_mode = config["sampling_mode"]
         self.n_candidates = config["n_candidates"]
         self.use_grid_sampling = self.n_candidates == 0
         self.noise_var = config["noise_var"]
-        self.bounds = config['bounds']
+
+        # self.bounds = config['bounds']
+        self.bounds = torch.tensor(config['bounds'], device=self.device, dtype=self.t_dtype)
+
+        self.kernel_type = config.get("kernel_type", "matern2.5")
 
         target_class = TARGETS_DICT[config["target_name"]]
         if config["target_name"] == "lennard_jones":
@@ -97,7 +110,8 @@ class ActiveLearningExperiment:
 
         n_initial = 50
         self.X_train = self.sample_domain_uniform(num=n_initial)
-        self.y_train = self.target.energy(self.X_train)
+        self.y_train = self.target.energy(self.X_train).to(dtype=self.t_dtype)
+
         self.history = []
 
         self.X_grid = None
@@ -112,9 +126,9 @@ class ActiveLearningExperiment:
                 print(f"Loading ground truth data from {config['gt_data_path']}...")
                 # assuming .npy file [N_samples, Dim] or [N_samples, Particles, 3]
                 gt_data = np.load(config["gt_data_path"])
-                self.X_gt = torch.tensor(gt_data, dtype=torch.float32).reshape(-1, self.dim)
+                self.X_gt = torch.tensor(gt_data, dtype=torch.float32, device=self.device).reshape(-1, self.dim)
                 # compute ground truth energies once
-                self.y_gt = self.target.energy(self.X_gt).detach().numpy().ravel()
+                self.y_gt = self.target.energy(self.X_gt).detach().cpu().numpy().ravel()
             except Exception as e:
                 print(f"failed to load GT data: {e}")
         
@@ -131,9 +145,9 @@ class ActiveLearningExperiment:
                 print(f"Loading BGflow baseline data from {config['bgflow_data_path']}...")
                 bg_data = np.load(config["bgflow_data_path"])
                 # Ensure correct shape (N, dim)
-                self.X_bgflow = torch.tensor(bg_data, dtype=torch.float32).reshape(-1, self.dim)
+                self.X_bgflow = torch.tensor(bg_data, dtype=self.t_dtype, device=self.device).reshape(-1, self.dim)
                 # Compute energies using OUR potential function to ensure fair comparison
-                self.y_bgflow = self.target.energy(self.X_bgflow).detach().numpy().ravel()
+                self.y_bgflow = self.target.energy(self.X_bgflow).detach().cpu().numpy().ravel()
             except Exception as e:
                 print(f"Failed to load BGflow data: {e}")
 
@@ -143,17 +157,16 @@ class ActiveLearningExperiment:
             try:
                 print(f"Loading PITA baseline data from {config['pita_data_path']}...")
                 pita_data = np.load(config["pita_data_path"])
-                self.X_pita = torch.tensor(pita_data, dtype=torch.float32).reshape(-1, self.dim)
-                self.y_pita = self.target.energy(self.X_pita).detach().numpy().ravel()
+                self.X_pita = torch.tensor(pita_data, dtype=self.t_dtype, device=self.device).reshape(-1, self.dim)
+                self.y_pita = self.target.energy(self.X_pita).detach().cpu().numpy().ravel()
             except Exception as e:
                 print(f"failed to load PITA data: {e}")
-
 
 
         os.makedirs(config['output_dir'], exist_ok=True)
 
     def sample_domain_uniform(self, num=1):
-        return torch.rand(num, *self.shape) * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
+        return torch.rand(num, *self.shape, device=self.device, dtype=self.t_dtype) * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
 
     def calculate_energy(self, mu, std, beta=1.0):
         mode = self.sampling_mode
@@ -185,25 +198,26 @@ class ActiveLearningExperiment:
             else:
                 x_next, debug_info = self._step_uniform(i)
             
-            y_next = self.target.energy(x_next)
+            y_next = self.target.energy(x_next).to(dtype=self.t_dtype)
             
             self.X_train = torch.cat([self.X_train, x_next], dim=0)
             self.y_train = torch.cat([self.y_train, y_next], dim=0)
             
             step_data = {
                 'iteration': i,
-                'x_next': x_next.clone(),
-                'y_next': y_next.clone(),
-                **debug_info
+                'x_next': x_next.cpu().clone(),
+                'y_next': y_next.cpu().clone(),
+                **{k: v.cpu() if isinstance(v, torch.Tensor) else v for k,v in debug_info.items()}
             }
             self.history.append(step_data)
             
             if i % 10 == 0: 
+
                 # LJ13 Specific Plotting
                 if self.cfg["target_name"] == "lennard_jones":
                     print(f"iter {i}: sampled energy y={y_next.item():.4f}")
                     self._plot_lj13_metrics(i)
-                
+
                 # Standard Dimensional Plotting
                 elif self.dim == 1:
                     self._plot_1d(i, debug_info)
@@ -214,11 +228,12 @@ class ActiveLearningExperiment:
                 
                 self._plot_rkl_loss(i)
 
-        self._save_results()
+            if i % 100 == 0:
+                self._save_results()
 
     def _setup_grid(self):
         pts_per_dim = max(2, int(self.cfg['n_grid'] ** (1 / self.dim)))        
-        ranges = [torch.linspace(self.bounds[0], self.bounds[1], pts_per_dim) for _ in range(self.dim)]
+        ranges = [torch.linspace(self.bounds[0], self.bounds[1], pts_per_dim, device=self.device, dtype=self.t_dtype) for _ in range(self.dim)]
         grids = torch.meshgrid(*ranges, indexing='ij')
         self.X_grid = torch.stack(grids, dim=-1).reshape(-1, self.dim)
         self.n_grid = self.X_grid.shape[0]
@@ -260,31 +275,102 @@ class ActiveLearningExperiment:
         
         # logsumexp(logits) - log(N)
         log_Z = torch.logsumexp(logits, dim=0) - math.log(logits.shape[0])
-        return log_Z
+        return log_Z.item()
 
     def _step_uniform(self, iter_idx):
         candidates = self.sample_domain_uniform(num=self.n_candidates)
         return self._step_with_candidates(iter_idx, candidates)
 
+    # def _step_with_candidates(self, iter_idx, candidates):
+    #     assert (list(candidates.shape)[1:] == list(self.shape))
+
+    #     mu, var = get_gp_posterior(self.X_train, self.y_train, candidates, lengthscale=1.0, noise_var=self.noise_var)
+    #     all_candidates = candidates
+    #     std = torch.sqrt(torch.clamp(var, min=1e-6))
+    #     energy = self.calculate_energy(mu, std)
+    #     prob_densities = self._get_probs(energy)
+    #     categorical = torch.distributions.Categorical(prob_densities.squeeze())
+    #     next_idx = categorical.sample()
+    #     x_next = all_candidates[next_idx].view(1, *self.shape) 
+        
+    #     return x_next, {
+    #         'mu': mu.cpu(),
+    #         'std': std.cpu(),
+    #         'densities': prob_densities.cpu(),
+    #         'candidates': all_candidates.cpu() if not self.use_grid_sampling else None,
+    #     }
+
+
     def _step_with_candidates(self, iter_idx, candidates):
         assert (list(candidates.shape)[1:] == list(self.shape))
 
-        mu, var = get_gp_posterior(self.X_train, self.y_train, candidates, lengthscale=1.0, noise_var=self.noise_var)
-        all_candidates = candidates
+        # NOTE: start of standard gp implementation
+
+        # normalize inputs to [0,1]
+        # (x - min) / (max - min)
+        X_train_norm = (self.X_train - self.bounds[0]) / (self.bounds[1] - self.bounds[0])
+        candidates_norm = (candidates - self.bounds[0]) / (self.bounds[1] - self.bounds[0])
+
+        # standardize outputs (mean 0, var 1)
+        Y_mean = self.y_train.mean()
+        Y_std = self.y_train.std() + 1e-6 # avoid div by zero
+        Y_train_std = (self.y_train - Y_mean) / Y_std
+
+        # construct kernel based on config
+        # "Standard GP" paper suggests ARD (ard_num_dims=dim)
+        if self.kernel_type == "rbf":
+            covar_module = ScaleKernel(RBFKernel(ard_num_dims=self.dim))
+        elif self.kernel_type == "matern1.5":
+            covar_module = ScaleKernel(MaternKernel(nu=1.5, ard_num_dims=self.dim))
+        elif self.kernel_type == "matern2.5":
+            covar_module = ScaleKernel(MaternKernel(nu=2.5, ard_num_dims=self.dim))
+        else:
+            raise ValueError(f"Unknown kernel type: {self.kernel_type}")
+
+        # initialize SingleTaskGP
+        # assume homoskedastic noise inferred by MLL, or we can set prior on noise
+        gp = SingleTaskGP(X_train_norm, Y_train_std, covar_module=covar_module)
+
+        # fit hyperparameters using MLL
+        mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
+        # use BoTorch helper to optimize MLL
+        # this performs the optimization loop (L-BFGS-B by default)
+        try:
+            fit_gpytorch_mll(mll)
+        except Exception as e:
+            print(f"Warning: GP fitting failed with {e}, using current params")
+
+        # predict on candidates (in standardized space)
+        gp.eval()
+        with torch.no_grad():
+            posterior = gp.posterior(candidates_norm)
+            mu_std = posterior.mean
+            sigma_std = torch.sqrt(posterior.variance)
+
+        # un-standardize predictions for energy calculation
+        # mu_raw = mu_std * Y_std + Y_mean
+        # sigma_raw = sigma_std * Y_std
+        # NOTE: self.calculate_energy uses these raw values to compute "energy" E(x)
+        # if we use standardized values, T must be scaled, better to scale back
+        mu = mu_std * Y_std + Y_mean
+        var = (sigma_std * Y_std) ** 2
+
+        # NOTE: end of standard gp
+
         std = torch.sqrt(torch.clamp(var, min=1e-6))
         energy = self.calculate_energy(mu, std)
         prob_densities = self._get_probs(energy)
+
         categorical = torch.distributions.Categorical(prob_densities.squeeze())
         next_idx = categorical.sample()
-        x_next = all_candidates[next_idx].view(1, *self.shape) 
-        
-        return x_next, {
-            'mu': mu.cpu(),
-            'std': std.cpu(),
-            'densities': prob_densities.cpu(),
-            'candidates': all_candidates.cpu() if not self.use_grid_sampling else None,
-        }
+        x_next = candidates[next_idx].view(1, *self.shape) 
 
+        return x_next, {
+            'mu': mu,
+            'std': std,
+            'densities': prob_densities,
+            'candidates': candidates if not self.use_grid_sampling else None,
+        }
 
     def _plot_lj13_metrics(self, iter_idx):
         # GROUND TRUTH - gray
@@ -294,8 +380,8 @@ class ActiveLearningExperiment:
         # plots histograms for (1) potential energy and (2) interatomic distances
         # filters NaN/Inf and clips extreme outliers for visibility
 
-        X_gen = self.X_train.detach() 
-        y_gen = self.y_train.detach().numpy().ravel()
+        X_gen = self.X_train.detach().cpu()
+        y_gen = self.y_train.detach().cpu().numpy().ravel()
         
         valid_indices = np.isfinite(y_gen)
         y_gen_clean = y_gen[valid_indices]
@@ -309,10 +395,7 @@ class ActiveLearningExperiment:
         
         # compute distance
         dists_gen = compute_pairwise_distances(X_gen_clean, self.n_particles, n_dims=3).numpy()
-        dists_gt = compute_pairwise_distances(self.X_gt, self.n_particles, n_dims=3).numpy()
-        
-
-
+        dists_gt = compute_pairwise_distances(self.X_gt.cpu(), self.n_particles, n_dims=3).numpy()
 
         # prepare bgflow
         y_bg_clean = np.array([])
@@ -321,7 +404,7 @@ class ActiveLearningExperiment:
             y_bg_raw = self.y_bgflow
             valid_bg = np.isfinite(y_bg_raw)
             y_bg_clean = y_bg_raw[valid_bg]
-            X_bg_clean = self.X_bgflow[torch.tensor(valid_bg)]
+            X_bg_clean = self.X_bgflow.cpu()[torch.tensor(valid_bg)]
             if len(y_bg_clean) > 0:
                 dists_bg = compute_pairwise_distances(X_bg_clean, self.n_particles, n_dims=3).numpy()
 
@@ -332,7 +415,7 @@ class ActiveLearningExperiment:
             y_pita_raw = self.y_pita
             valid_pita = np.isfinite(y_pita_raw)
             y_pita_clean = y_pita_raw[valid_pita]
-            X_pita_clean = self.X_pita[torch.tensor(valid_pita)]
+            X_pita_clean = self.X_pita.cpu()[torch.tensor(valid_pita)]
             if len(y_pita_clean) > 0:
                 dists_pita = compute_pairwise_distances(X_pita_clean, self.n_particles, n_dims=3).numpy()
 
@@ -403,36 +486,36 @@ class ActiveLearningExperiment:
 
 
     def _plot_1d(self, iter_idx, debug_info):
-        X_grid = self.X_grid
-        mu = debug_info['mu']
-        std = debug_info['std']
-        densities = debug_info['densities']
+        X_grid = self.X_grid.cpu()
+        mu = debug_info['mu'].cpu()
+        std = debug_info['std'].cpu()
+        densities = debug_info['densities'].cpu()
         
         plt.figure(figsize=(10, 8))
         
         plt.subplot(2, 1, 1)
-        plt.plot(X_grid.numpy(), self.target_energies.numpy(), 'k--', label="truth")
+        plt.plot(X_grid.numpy(), self.target_energies.cpu().numpy(), 'k--', label="truth")
         plt.plot(X_grid.numpy(), mu.numpy(), 'b-', label="gp mean")
         plt.fill_between(X_grid.view(-1).numpy(), 
                         (mu - 2*std).view(-1).numpy(), 
                         (mu + 2*std).view(-1).numpy(), 
                         color='blue', alpha=0.2, label="uncertainty")
-        plt.scatter(self.X_train.numpy(), self.y_train.numpy(), c='k', marker='x', label="data")
+        plt.scatter(self.X_train.cpu().numpy(), self.y_train.cpu().numpy(), c='k', marker='x', label="data")
         plt.title(f"iter {iter_idx} (sampling mode: {self.cfg['sampling_mode']})")
         plt.legend()
         
         plt.subplot(2, 1, 2)
         plt.plot(X_grid.numpy(), densities.numpy(), 'r-', linewidth=2, label="model p(x)")
         plt.fill_between(X_grid.view(-1).numpy(), 0, densities.view(-1).numpy(), color='red', alpha=0.1)
-        plt.plot(X_grid.numpy(), self.target_densities.numpy(), 'g--', linewidth=2, label="target p(x)")
+        plt.plot(X_grid.numpy(), self.target_densities.cpu().numpy(), 'g--', linewidth=2, label="target p(x)")
         
         x_sampled = self.X_train.detach().cpu().numpy().ravel()
         plt.hist(x_sampled, bins=40, density=True, alpha=0.5, color='purple', 
                  label=f'sampled X (history, N={len(x_sampled)})')
         
         try:
-            kde = stats.gaussian_kde(self.X_train.T, bw_method="silverman")
-            kde_densities = kde.evaluate(self.X_grid.T)
+            kde = stats.gaussian_kde(self.X_train.cpu().T, bw_method="silverman")
+            kde_densities = kde.evaluate(self.X_grid.cpu().T)
             plt.plot(X_grid.numpy(), kde_densities, 'b--', linewidth=2, label="empirical kde")
         except:
             pass
@@ -445,19 +528,20 @@ class ActiveLearningExperiment:
         plt.savefig(filename)
         plt.close()
 
-    def _plot_2d(self, iter_idx, debug_info):        
+    def _plot_2d(self, iter_idx, debug_info):    
+        print(self.X_grid)    
         if self.X_grid is None: return
         pts_per_dim = int(self.n_grid ** 0.5) 
-        X = self.X_grid[:, 0].view(pts_per_dim, pts_per_dim).numpy()
-        Y = self.X_grid[:, 1].view(pts_per_dim, pts_per_dim).numpy()
+        X = self.X_grid[:, 0].view(pts_per_dim, pts_per_dim).cpu().numpy()
+        Y = self.X_grid[:, 1].view(pts_per_dim, pts_per_dim).cpu().numpy()
         
-        truth = self.target_energies.view(pts_per_dim, pts_per_dim).numpy()
+        truth = self.target_energies.view(pts_per_dim, pts_per_dim).cpu().numpy()
         vmax = np.percentile(truth, 95) 
         
-        mu = debug_info['mu'].view(pts_per_dim, pts_per_dim).numpy()
-        densities = debug_info['densities'].view(pts_per_dim, pts_per_dim).numpy()
+        mu = debug_info['mu'].view(pts_per_dim, pts_per_dim).cpu().numpy()
+        densities = debug_info['densities'].view(pts_per_dim, pts_per_dim).cpu().numpy()
         
-        train_x = self.X_train.numpy()
+        train_x = self.X_train.cpu().numpy()
 
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
         
@@ -477,6 +561,7 @@ class ActiveLearningExperiment:
         plt.colorbar(c3, ax=axes[2])
         
         plt.suptitle(f"iter {iter_idx}: 2d energy")
+        print(self.cfg['output_dir'])
         filename = os.path.join(self.cfg['output_dir'], f"plot_2d_{iter_idx:04d}.png")
         plt.savefig(filename)
         plt.close()
@@ -486,14 +571,14 @@ class ActiveLearningExperiment:
              return
         
         try:
-            kde = stats.gaussian_kde(self.X_train.reshape(self.X_train.shape[0], -1).T, bw_method="silverman")
+            kde = stats.gaussian_kde(self.X_train.reshape(self.X_train.shape[0], -1).cpu().T, bw_method="silverman")
             output = 0
             for x, y in zip(self.X_train, self.y_train):  
                 # MODIFIED: Use log_Z for robust calculation
                 # p_norm = exp(-y - log_Z)
                 log_p_norm = -y - self.log_Z
                 
-                q_val = kde.evaluate(x.reshape(-1, 1).numpy())[0]
+                q_val = kde.evaluate(x.reshape(-1, 1).cpu().numpy())[0]
                 
                 if q_val > 1e-100:
                     log_q = np.log(q_val)
@@ -521,15 +606,32 @@ class ActiveLearningExperiment:
         except Exception as e:
             pass
         
+
     def _plot_high_dim_slices(self, x_center, iter_idx, dims_to_plot=[0, 1, 2]):
         n_plots = len(dims_to_plot)
         fig, axes = plt.subplots(2, n_plots, figsize=(4 * n_plots, 6), sharex='col')
         if n_plots == 1: axes = axes.reshape(2, 1) 
+        
         N_slice = 200
-        linspace = torch.linspace(self.bounds[0], self.bounds[1], N_slice)
-        N = self.X_train.shape[0]
-        K = rbf_kernel_torch(self.X_train, self.X_train)
-        K_inv = torch.linalg.inv(K + self.noise_var * torch.eye(N))
+        linspace = torch.linspace(self.bounds[0], self.bounds[1], N_slice, device=self.device, dtype=self.t_dtype)
+        
+        # We need a quick GP for this visualization slice (or re-use fitted one if refactored)
+        # For visualization speed, we'll re-fit a quick GP on cpu or just compute posterior
+        # NOTE: To be consistent, we should use the fitted model. 
+        # But here we just re-fit quickly or simple RBF for visualization stability
+        
+        # Using the standard GP approach here as well
+        X_train_norm = (self.X_train - self.bounds[0]) / (self.bounds[1] - self.bounds[0])
+        Y_mean = self.y_train.mean()
+        Y_std = self.y_train.std() + 1e-6
+        Y_train_std = (self.y_train - Y_mean) / Y_std
+        
+        # Simple RBF for viz
+        covar_module = ScaleKernel(RBFKernel(ard_num_dims=self.dim))
+        gp = SingleTaskGP(X_train_norm, Y_train_std, covar_module=covar_module)
+        # mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
+        # fit_gpytorch_mll(mll) # Skipping fit for speed in viz loop, or fit lightly
+        gp.eval()
 
         for i, dim_idx in enumerate(dims_to_plot):
             x_slice = x_center.repeat(N_slice, 1) 
@@ -537,23 +639,24 @@ class ActiveLearningExperiment:
             x_slice_flat[:, dim_idx] = linspace
             x_slice = x_slice_flat.view(N_slice, *self.shape)
             
-            truth = self.target.energy(x_slice)
+            truth = self.target.energy(x_slice).detach().cpu()
             
-            K_s = rbf_kernel_torch(self.X_train, x_slice)
-            K_ss = rbf_kernel_torch(x_slice, x_slice)
+            # Predict
+            x_slice_norm = (x_slice.reshape(N_slice, -1) - self.bounds[0]) / (self.bounds[1] - self.bounds[0])
+            with torch.no_grad():
+                posterior = gp.posterior(x_slice_norm)
+                mu_std = posterior.mean
+                sigma_std = torch.sqrt(posterior.variance)
             
-            mu = K_s.T @ K_inv @ self.y_train
-            weighted_Ks = K_inv @ K_s
-            cov_term = torch.sum(K_s * weighted_Ks, dim=0).view(-1, 1)
-            var = torch.diag(K_ss).view(-1, 1) - cov_term
-            std = torch.sqrt(torch.clamp(var, min=1e-6))
+            mu = (mu_std * Y_std + Y_mean).cpu()
+            std = (sigma_std * Y_std).cpu()
             
-            energy_vis = self.calculate_energy(mu, std)
+            energy_vis = self.calculate_energy(mu, std).cpu()
             
             ax_gp = axes[0, i]
-            ax_gp.plot(linspace.numpy(), truth.numpy(), 'k--', label="truth")
-            ax_gp.plot(linspace.numpy(), mu.numpy(), 'b-', label="GP mean")
-            ax_gp.fill_between(linspace.numpy(), 
+            ax_gp.plot(linspace.cpu().numpy(), truth.numpy(), 'k--', label="truth")
+            ax_gp.plot(linspace.cpu().numpy(), mu.numpy(), 'b-', label="GP mean")
+            ax_gp.fill_between(linspace.cpu().numpy(), 
                            (mu - 2*std).flatten().numpy(), 
                            (mu + 2*std).flatten().numpy(), 
                            color='blue', alpha=0.2)
@@ -563,7 +666,7 @@ class ActiveLearningExperiment:
             if i == 0: ax_gp.legend(loc='best', fontsize='small')
             
             ax_en = axes[1, i]
-            ax_en.plot(linspace.numpy(), energy_vis.numpy(), 'r-', label=f"mode: {self.cfg['sampling_mode']}")
+            ax_en.plot(linspace.cpu().numpy(), energy_vis.numpy(), 'r-', label=f"mode: {self.cfg['sampling_mode']}")
             ax_en.axvline(x_center.reshape(-1)[dim_idx].item(), color='k', linestyle=':')
             ax_en.set_ylabel("energy")
             ax_en.set_xlabel(f"x_{dim_idx}")
@@ -574,6 +677,7 @@ class ActiveLearningExperiment:
         filename = os.path.join(self.cfg['output_dir'], f"plot_slice_{iter_idx:04d}.png")
         plt.savefig(filename)
         plt.close()
+
 
     def _save_results(self, only_cfg=False):
         if only_cfg:
@@ -594,8 +698,8 @@ class ActiveLearningExperiment:
         if only_cfg: return
         data_path = os.path.join(folder, f"data_{timestamp}.pt")
         save_dict = {
-            'X_train': self.X_train,
-            'y_train': self.y_train,
+            'X_train': self.X_train.cpu(),
+            'y_train': self.y_train.cpu(),
             'history': self.history,
             'config': self.cfg
         }
@@ -603,21 +707,23 @@ class ActiveLearningExperiment:
         print(f"Experiment saved to {folder}")
 
 def main(
-        target_name="lennard_jones",
-        dim=39, # for lj13, 13 particles * 3 dims = 39
+        target_name="double_well",
+        dim=2, # for lj13, 13 particles * 3 dims = 39
         output_dir="experiments",
-        seed=100,
+        seed=42,
         bounds=[-2.5, 2.5],
         n_grid=5000,
         n_iterations=10000, 
-        temperature=2.0,
-        noise_var =0.2,
+        temperature=1.0,
+        noise_var=0.05,
         sampling_mode="posterior",
-        n_candidates=1000,  # NOTE: use random candidates for high dim; grid fails > 3D
+        n_candidates=0,  # NOTE: use random candidates for high dim; grid fails >3d
+                         # NOTE: use n_candidates=0 for 1 and 2d; 5000 for >=3d
         lj_n_particles=13,
-        gt_data_path="./pita/data/lj13/LJ13_temp_3.0/train_split_LJ13-10000.npy",
-        bgflow_data_path="experiments/bgflow_lj13/bgflow_samples.npy",
-        pita_data_path="experiments/pita_lj13/pita_samples.npy"
+        gt_data_path="./pita/data/lj13/LJ13_temp_1.0/train_split_LJ13-10000.npy",
+        bgflow_data_path="experiments/bgflow_lj13/bgflow_samples_T1.0.npy",
+        pita_data_path="experiments/pita_lj13/pita_samples.npy",
+        kernel_type="matern2.5"
     ):
     config = {
         'git_hash': get_git_short_hash(),
@@ -635,7 +741,8 @@ def main(
         'lj_n_particles': lj_n_particles,
         'gt_data_path': gt_data_path,
         'bgflow_data_path': bgflow_data_path,
-        'pita_data_path': pita_data_path
+        'pita_data_path': pita_data_path,
+        'kernel_type': kernel_type
     }
 
     print(config)
