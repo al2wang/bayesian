@@ -168,21 +168,21 @@ def plot_comparison(
     ax = axes[0]
     
     # ground truth: plot WITHOUT forcing range (auto scale bins to GT data)
-    # NOTE: this matches main.py: axes[0].hist(y_gt, bins=50, ...)
-    ax.hist(y_gt, bins=50, density=True, alpha=0.6, color='gray', label='Ground Truth (MCMC)')
+    # NOTE: this matches main.py: axes[0].hist(y_gt, bins=100, ...)
+    ax.hist(y_gt, bins=100, density=True, alpha=0.6, color='gray', label='Ground Truth (MCMC)')
 
     # generated data: plot WITH forced range (clipped view)
     # NOTE: this matches main.py: axes[0].hist(..., range=(lower_bound, upper_bound))
     if data_bgflow:
-        ax.hist(data_bgflow['y'], bins=50, density=True, alpha=0.5, color='blue',
+        ax.hist(data_bgflow['y'], bins=100, density=True, alpha=0.5, color='blue',
                 range=(lower_bound, upper_bound), label=f"BGflow")
         
     if data_pita:
-        ax.hist(data_pita['y'], bins=50, density=True, alpha=0.4, color='green',
+        ax.hist(data_pita['y'], bins=100, density=True, alpha=0.4, color='green',
                 range=(lower_bound, upper_bound), label=f"PITA")
 
     if data_active:
-        ax.hist(data_active['y'], bins=50, density=True, alpha=0.3, color='red',
+        ax.hist(data_active['y'], bins=100, density=True, alpha=0.3, color='red',
                 range=(lower_bound, upper_bound), label=f"Active Sampler")
 
     ax.set_xlabel("Potential Energy")
@@ -194,14 +194,14 @@ def plot_comparison(
     # PLOT #2 : INTERATOMIC DISTANCE
     ax = axes[1]
     
-    ax.hist(data_gt['dists_clean'], bins=50, density=True, alpha=0.6, color='gray', label='Ground Truth')
+    ax.hist(data_gt['dists_clean'], bins=100, density=True, alpha=0.6, color='gray', label='Ground Truth')
     
     if data_bgflow:
-        ax.hist(data_bgflow['dists_clean'], bins=50, density=True, alpha=0.5, color='blue', label='BGflow')
+        ax.hist(data_bgflow['dists_clean'], bins=100, density=True, alpha=0.5, color='blue', label='BGflow')
     if data_pita:
-        ax.hist(data_pita['dists_clean'], bins=50, density=True, alpha=0.4, color='green', label='PITA')
+        ax.hist(data_pita['dists_clean'], bins=100, density=True, alpha=0.4, color='green', label='PITA')
     if data_active:
-        ax.hist(data_active['dists_clean'], bins=50, density=True, alpha=0.3, color='red', label='Active Sampler')
+        ax.hist(data_active['dists_clean'], bins=100, density=True, alpha=0.3, color='red', label='Active Sampler')
 
     ax.set_xlabel("Interatomic Distance")
     ax.set_ylabel("Normalized Density")
