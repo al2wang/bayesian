@@ -34,22 +34,22 @@ def get_git_short_hash():
     except Exception as e:
         return "git_not_found"
 
-def rbf_kernel_torch(x1, x2, lengthscale=1.0, variance=1.0):
-    x1 = x1.reshape(x1.shape[0], -1)
-    x2 = x2.reshape(x2.shape[0], -1)
-    sqdist = torch.cdist(x1, x2)**2
-    return variance * torch.exp(-0.5 / lengthscale**2 * sqdist)
+# def rbf_kernel_torch(x1, x2, lengthscale=1.0, variance=1.0):
+#     x1 = x1.reshape(x1.shape[0], -1)
+#     x2 = x2.reshape(x2.shape[0], -1)
+#     sqdist = torch.cdist(x1, x2)**2
+#     return variance * torch.exp(-0.5 / lengthscale**2 * sqdist)
 
-def get_gp_posterior(X_train, y_train, X_test, lengthscale, noise_var):
-    N = X_train.shape[0]
-    K = rbf_kernel_torch(X_train, X_train, lengthscale)
-    K_s = rbf_kernel_torch(X_train, X_test, lengthscale)
-    K_ss = rbf_kernel_torch(X_test, X_test, lengthscale)
-    K_inv = torch.linalg.inv(K + noise_var * torch.eye(N))   
-    mu = K_s.T @ K_inv @ y_train
-    cov = K_ss - K_s.T @ K_inv @ K_s
-    var = torch.diag(cov).view(-1, 1)
-    return mu, var
+# def get_gp_posterior(X_train, y_train, X_test, lengthscale, noise_var):
+#     N = X_train.shape[0]
+#     K = rbf_kernel_torch(X_train, X_train, lengthscale)
+#     K_s = rbf_kernel_torch(X_train, X_test, lengthscale)
+#     K_ss = rbf_kernel_torch(X_test, X_test, lengthscale)
+#     K_inv = torch.linalg.inv(K + noise_var * torch.eye(N, device=torch.device("cuda")))   
+#     mu = K_s.T @ K_inv @ y_train
+#     cov = K_ss - K_s.T @ K_inv @ K_s
+#     var = torch.diag(cov).view(-1, 1)
+#     return mu, var
 
 
 def compute_pairwise_distances(x, n_particles, n_dims=3):
@@ -173,6 +173,8 @@ class ActiveLearningExperiment:
         assert mode in ["pessimistic", "greedy", "posterior"]
         if mode == "pessimistic":
             return mu - beta * std
+        if mode == "optimistic":
+            return mu + beta * std
         elif mode == "greedy":
             return mu
         else:
@@ -228,7 +230,7 @@ class ActiveLearningExperiment:
                 
                 self._plot_rkl_loss(i)
 
-            if i % 100 == 0:
+            if i % 1000 == 1:
                 self._save_results()
 
     def _setup_grid(self):
@@ -707,17 +709,17 @@ class ActiveLearningExperiment:
         print(f"Experiment saved to {folder}")
 
 def main(
-        target_name="double_well",
-        dim=2, # for lj13, 13 particles * 3 dims = 39
-        output_dir="experiments",
+        target_name="toy_sin_cos",
+        dim=1, # for lj13, 13 particles * 3 dims = 39
+        output_dir="experiments_1214",
         seed=42,
         bounds=[-2.5, 2.5],
         n_grid=5000,
-        n_iterations=10000, 
-        temperature=1.0,
-        noise_var=0.05,
+        n_iterations=10001, 
+        temperature=2.0,
+        noise_var=0.1,
         sampling_mode="posterior",
-        n_candidates=0,  # NOTE: use random candidates for high dim; grid fails >3d
+        n_candidates=5000,  # NOTE: use random candidates for high dim; grid fails >3d
                          # NOTE: use n_candidates=0 for 1 and 2d; 5000 for >=3d
         lj_n_particles=13,
         gt_data_path="./pita/data/lj13/LJ13_temp_1.0/train_split_LJ13-10000.npy",
