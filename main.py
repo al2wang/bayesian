@@ -28,7 +28,7 @@ PLOT_BASELINES = False
 def get_git_short_hash():
     try:
         return subprocess.check_output(
-            ["git", "describe", "--always"], 
+            ["git", "describe", "--always"],
             cwd=Path(__file__).resolve().parent
         ).strip().decode()
     except Exception as e:
@@ -40,7 +40,7 @@ def get_git_short_hash():
 #     sqdist = torch.cdist(x1, x2)**2
 #     return variance * torch.exp(-0.5 / lengthscale**2 * sqdist)
 
-# def get_gp_posterior(X_train, y_train, X_test, lengthscale, noise_var):
+# def get_gp_posterior(X_train, y_train, X_test, lengthscale, noisetep_var):
 #     N = X_train.shape[0]
 #     K = rbf_kernel_torch(X_train, X_train, lengthscale)
 #     K_s = rbf_kernel_torch(X_train, X_test, lengthscale)
@@ -170,10 +170,10 @@ class ActiveLearningExperiment:
 
     def calculate_energy(self, mu, std, beta=1.0):
         mode = self.sampling_mode
-        assert mode in ["pessimistic", "greedy", "posterior"]
+        assert mode in ["pessimistic", "optimistic", "greedy", "posterior"]
         if mode == "pessimistic":
             return mu - beta * std
-        if mode == "optimistic":
+        elif mode == "optimistic":
             return mu + beta * std
         elif mode == "greedy":
             return mu
@@ -213,7 +213,7 @@ class ActiveLearningExperiment:
             }
             self.history.append(step_data)
             
-            if i % 10 == 0: 
+            if i % 10 == 0:
 
                 # LJ13 Specific Plotting
                 if self.cfg["target_name"] == "lennard_jones":
@@ -229,6 +229,11 @@ class ActiveLearningExperiment:
                     self._plot_high_dim_slices(x_next.detach(), i)
                 
                 self._plot_rkl_loss(i)
+
+                # if i >= 20:
+                #     print(f'::: shape of x_next: {x_next.shape}')
+                #     print(f'::: shape of self.X_train: {self.X_train.shape}')
+                #     assert(False)
 
             if i % 1000 == 1:
                 self._save_results()
@@ -331,7 +336,7 @@ class ActiveLearningExperiment:
 
         # initialize SingleTaskGP
         # assume homoskedastic noise inferred by MLL, or we can set prior on noise
-        gp = SingleTaskGP(X_train_norm, Y_train_std, covar_module=covar_module)
+        gp = SingleTaskGP(X_train_norm, Y_train_std, covar_module=covar_module, outcome_transform=None)
 
         # fit hyperparameters using MLL
         mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
@@ -365,7 +370,7 @@ class ActiveLearningExperiment:
 
         categorical = torch.distributions.Categorical(prob_densities.squeeze())
         next_idx = categorical.sample()
-        x_next = candidates[next_idx].view(1, *self.shape) 
+        x_next = candidates[next_idx].view(1, *self.shape)
 
         return x_next, {
             'mu': mu,
@@ -709,8 +714,8 @@ class ActiveLearningExperiment:
         print(f"Experiment saved to {folder}")
 
 def main(
-        target_name="toy_sin_cos",
-        dim=1, # for lj13, 13 particles * 3 dims = 39
+        target_name="lennard_jones",
+        dim=39, # for lj13, 13 particles * 3 dims = 39
         output_dir="experiments_1214",
         seed=42,
         bounds=[-2.5, 2.5],
@@ -718,7 +723,7 @@ def main(
         n_iterations=10001, 
         temperature=2.0,
         noise_var=0.1,
-        sampling_mode="posterior",
+        sampling_mode="posterior",  # optimistic, greedy, pessimistic
         n_candidates=5000,  # NOTE: use random candidates for high dim; grid fails >3d
                          # NOTE: use n_candidates=0 for 1 and 2d; 5000 for >=3d
         lj_n_particles=13,
